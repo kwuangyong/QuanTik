@@ -1,4 +1,4 @@
-import numpy as np, pandas as pd, logging, warnings, glob, json, sys, hashlib, math
+import numpy as np, pandas as pd, logging, warnings, glob, json, sys, hashlib, math, unicodedata
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
@@ -20,7 +20,28 @@ warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger("quant_pipeline")
 
-# === CONFIG ===
+def _column_key(value):
+    """Stable schema matching for Vietnamese and unaccented Excel headers."""
+    return ''.join(c for c in unicodedata.normalize('NFKD', str(value).lower())
+                   if not unicodedata.combining(c)).replace('đ', 'd').strip()
+
+def _completed_daily_bars(df, now=None):
+    """Daily strategy policy: today's snapshot is eligible only from 16:00 VN.
+
+    This is a conservative ingestion cutoff, not an exchange settlement calendar.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        return df
+    stamp = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz='Asia/Ho_Chi_Minh')
+    stamp = stamp.tz_localize('Asia/Ho_Chi_Minh') if stamp.tzinfo is None else stamp.tz_convert('Asia/Ho_Chi_Minh')
+    dates = df.index.tz_localize('Asia/Ho_Chi_Minh') if df.index.tz is None else df.index.tz_convert('Asia/Ho_Chi_Minh')
+    cutoff = stamp.normalize() if stamp.hour < 16 else stamp
+    out = df.loc[dates < cutoff].copy()
+    out.attrs['as_of'] = stamp.isoformat()
+    out.attrs['excluded_unfinished_rows'] = len(df) - len(out)
+    return out
+
+# CONFIG
 @dataclass
 class QuantConfig:
     LOOKBACK_DAYS: int = 252; MIN_HISTORY: int = 120; RISK_FREE_RATE: float = 0.045
@@ -82,12 +103,29 @@ class QuantConfig:
     VISUAL_TOP_N: int = 10
     VISUAL_OUTPUT_DIR: str = 'output'
 
+    # === V7 AGREEMENT ARCHITECTURE ===
+    # Directional alpha is deliberately separated from distribution/risk models.
+    MOMENTUM_ALPHA_WEIGHT: float = 0.40
+    LIGHTGBM_ALPHA_WEIGHT: float = 0.45
+    CONDITIONAL_MR_WEIGHT: float = 0.15
+    ALPHA_NEUTRAL_RET_PCT: float = 0.50
+    AGREEMENT_MIN_ACTIVE_MODELS: int = 2
+    AGREEMENT_MIN_COVERAGE_PCT: float = 60.0
+    AGREEMENT_MIN_PCT: float = 65.0
+    AGREEMENT_MIN_SUPPORT_PCT: float = 25.0
+    HURST_TREND_THRESHOLD: float = 0.55
+    HURST_REVERSION_THRESHOLD: float = 0.45
+    CONDITIONAL_MR_Z_MIN: float = 1.25
+    LIGHTGBM_MIN_TRAIN_ROWS: int = 400
+    LIGHTGBM_MIN_SYMBOLS: int = 5
+    META_LABEL_MIN_SAMPLES: int = 80
+    META_READY_PROB: float = 0.58
+    META_WATCH_PROB: float = 0.50
+    FORECAST_LOG_PATH: str = 'forecast_log.csv'
+
 CFG = QuantConfig()
 
-
-# ==============================================================
 # V6-A: VIETNAM MARKET RULES / UNITS / COSTS
-# ==============================================================
 
 class VNMarketRules:
     """Quy tắc giao dịch cơ sở Việt Nam. Tất cả giá đầu vào của class này là VND."""
@@ -99,19 +137,23 @@ class VNMarketRules:
 
     @classmethod
     def normalize_exchange(cls, exchange):
-        x = str(exchange or CFG.DEFAULT_EXCHANGE).upper().replace(' ', '')
+        x = str(exchange or 'UNKNOWN').upper().replace(' ', '')
         for name, profile in cls.PROFILES.items():
             if x == name or x in profile['aliases']:
                 return name
-        return CFG.DEFAULT_EXCHANGE
+        return 'UNKNOWN'
 
     @classmethod
     def profile(cls, exchange):
-        return cls.PROFILES[cls.normalize_exchange(exchange)]
+        ex = cls.normalize_exchange(exchange)
+        if ex not in cls.PROFILES:
+            raise ValueError(f'Unknown exchange: {exchange}')
+        return cls.PROFILES[ex]
 
     @classmethod
     def tick_size(cls, price_vnd, exchange='HOSE'):
         ex = cls.normalize_exchange(exchange)
+        cls.profile(ex)  # Never silently apply a different exchange's tick rules.
         p = float(price_vnd)
         if ex == 'HOSE':
             if p < 10_000: return 10.0
@@ -286,31 +328,53 @@ class ActionEngine:
     def decide(report):
         rc = report.get('rec',{}); fc = report.get('fcast',{}); dq = report.get('data_quality',{})
         liq = report.get('liquidity',{}); costs = report.get('costs',{}); sl = report.get('sl',{})
-        score = int(rc.get('score',0)); vni = rc.get('vni_regime','NEUTRAL')
+        score = int(rc.get('score',0)); vni = rc.get('vni_regime','UNKNOWN')
         timing = fc.get('timing',''); net_fc = costs.get('net_forecast_pct', fc.get('ensemble_ret_pct',0))
         reasons = []
+        try:
+            net_fc = float(net_fc)
+        except (TypeError, ValueError):
+            net_fc = float('nan')
+        if not np.isfinite(net_fc): reasons.append('INVALID_FORECAST')
+        if VNMarketRules.normalize_exchange(report.get('exchange')) == 'UNKNOWN': reasons.append('UNKNOWN_EXCHANGE')
+        if vni == 'UNKNOWN': reasons.append('VNI_DATA_MISSING')
         if dq.get('status') not in ('PASS', 'WARN'): reasons.append('DATA_QUALITY_FAIL')
         if not liq.get('pass', False): reasons.append('LIQUIDITY_FAIL')
         if vni == 'CRISIS': reasons.append('VNI_CRISIS')
-        if str(timing).startswith('🔴'): reasons.append('TIMING_BLOCKED')
+        if fc.get('timing_status') == 'BLOCKED': reasons.append('TIMING_BLOCKED')
         if sl.get('lock_risk_flag'): reasons.append('SETTLEMENT_LOCK_RISK')
         if net_fc < CFG.MIN_NET_FORECAST_PCT: reasons.append('NET_FORECAST_TOO_LOW')
 
-        hard_block = any(x in reasons for x in ('DATA_QUALITY_FAIL','LIQUIDITY_FAIL','VNI_CRISIS','TIMING_BLOCKED'))
+        levels = [sl.get(k) for k in ('sl_swing', 'entry', 'tp1', 'tp2')]
+        try:
+            levels = [float(x) for x in levels]
+            valid_plan = all(np.isfinite(x) for x in levels) and 0 < levels[0] < levels[1] < levels[2] < levels[3]
+        except (TypeError, ValueError):
+            valid_plan = False
+        if not valid_plan or sl.get('plan_valid') is False: reasons.append('INVALID_TRADE_PLAN')
+        if not (report.get('pos',{}).get('shares',0) > 0): reasons.append('ZERO_POSITION_SIZE')
+        timing_ready = fc.get('timing_status') == 'READY'
+        if not timing_ready: reasons.append('TIMING_NOT_READY')
+
+        hard_block = any(x in reasons for x in ('DATA_QUALITY_FAIL','LIQUIDITY_FAIL','VNI_CRISIS','TIMING_BLOCKED',
+                                               'INVALID_FORECAST','UNKNOWN_EXCHANGE','VNI_DATA_MISSING',
+                                               'INVALID_TRADE_PLAN','ZERO_POSITION_SIZE'))
         if hard_block:
             action = 'AVOID'
-        elif score >= 75 and vni not in ('BEAR','WEAK') and net_fc >= CFG.MIN_NET_FORECAST_PCT:
+        elif score >= 75 and vni not in ('BEAR','WEAK') and not reasons:
             action = 'BUY_NOW'
-        elif score >= 65 and net_fc > 0 and vni != 'BEAR':
-            action = 'BUY_SETUP'
+        elif score >= 65 and net_fc >= CFG.MIN_NET_FORECAST_PCT and vni != 'BEAR':
+            # No explicit entry trigger yet: remain WATCH, never fabricate a setup.
+            action = 'WATCH'
         elif score >= 50 and net_fc > 0:
             action = 'WATCH'
         else:
             action = 'AVOID'
 
-        gate_pass = action in ('BUY_NOW','BUY_SETUP')
-        return {'action': action, 'gate_pass': gate_pass, 'reason_codes': reasons,
-                'net_forecast_pct': round(float(net_fc),3)}
+        gate_pass = action == 'BUY_NOW'
+        return {'action': action, 'gate_pass': gate_pass, 'executable': gate_pass,
+                'reason_codes': reasons,
+                'net_forecast_pct': round(net_fc,3) if np.isfinite(net_fc) else None}
 
 
 class DashboardArchitecture:
@@ -318,9 +382,9 @@ class DashboardArchitecture:
         ('01','Market Regime','VNINDEX regime, crash circuit breaker, breadth/sector context'),
         ('02','Data Quality','freshness, OHLC consistency, missing sessions, corporate-action jumps'),
         ('03','Liquidity & Tradability','ADV20, capacity, zero volume, gap/ceiling/floor risk'),
-        ('04','Signal & Relative Strength','trend, momentum, CMF, RS vs VNINDEX, sector'),
-        ('05','Forecast & Uncertainty','GARCH-t Monte Carlo, HMM regime, model agreement'),
-        ('06','Costs & Risk','round-trip costs, VaR/CVaR, ATR stop, settlement lock'),
+        ('04','Directional Alpha','multi-horizon momentum, LightGBM cross-sectional, conditional residual reversion'),
+        ('05','Regime & Meta Gate','Hurst/HMM routing, Agreement coverage/support, logistic meta-label'),
+        ('06','Distribution & Risk','GARCH-t Monte Carlo, T-lock, liquidity, gap, costs, VaR/CVaR'),
         ('07','Position & Exposure','risk budget, allocation cap, ADV capacity, board lot'),
         ('08','Action Gate','BUY_NOW / BUY_SETUP / WATCH / AVOID + reason codes'),
         ('09','System Health','source success, stale data, model failures, export status'),
@@ -330,11 +394,7 @@ class DashboardArchitecture:
     def as_dataframe(cls):
         return pd.DataFrame(cls.MODULES, columns=['ID','Dashboard','Purpose'])
 
-# ==============================================================
-# BRIDGE: Doc Excel tu anhson.py + Lay OHLCV data
 # V4.2 — Multi-source fallback: KBS (primary) → VCI (backup)
-# VCI & TCBS deprecated — removed
-# ==============================================================
 
 class ScreenerBridge:
     """Cau noi giua anhson.py (Screener) va Quant Pipeline.
@@ -391,7 +451,7 @@ class ScreenerBridge:
             df = pd.read_excel(filepath)
             sym_col = None
             for col in df.columns:
-                if any(kw in str(col).lower() for kw in ['ma', 'symbol', 'ticker', 'ma ck']):
+                if _column_key(col) in ('ma', 'ma ck', 'ma cp', 'symbol', 'ticker'):
                     sym_col = col; break
             if sym_col is None: sym_col = df.columns[0]
             symbols = [s for s in df[sym_col].astype(str).str.strip().str.upper().tolist()
@@ -451,10 +511,16 @@ class ScreenerBridge:
 
         df = df.sort_index()
 
-        # Numeric coercion + drop bad rows
+        # Reject corrupt raw rows before cleaning can conceal source errors.
         for c in required:
             df[c] = pd.to_numeric(df[c], errors='coerce')
-        df = df.dropna(subset=['close'])
+        if (df.index.hasnans or df.index.duplicated().any()
+                or not np.isfinite(df[required].to_numpy()).all()
+                or (df[['open','high','low','close']] <= 0).any().any()
+                or (df['volume'] < 0).any()
+                or (df['high'] < df[['open','close','low']].max(axis=1)).any()
+                or (df['low'] > df[['open','close']].min(axis=1)).any()):
+            return None
 
         # Chuẩn hóa đơn vị giá về VND ngay tại data boundary.
         unit = str(CFG.PRICE_INPUT_UNIT).upper()
@@ -477,7 +543,7 @@ class ScreenerBridge:
         if out is not None:
             out.attrs['price_unit'] = 'VND'
             out.attrs['source'] = source
-        return out
+        return _completed_daily_bars(out)
 
     def _fetch_single(self, symbol, start, end, source):
         """Fetch 1 symbol từ 1 source cụ thể. Raise exception nếu fail.
@@ -563,38 +629,48 @@ class ScreenerBridge:
         return None
 
     def fetch_exchange_map(self, symbols):
-        """Tra cứu sàn bằng Reference().equity.list_by_exchange(); fallback DEFAULT_EXCHANGE."""
-        out = {str(s).upper(): CFG.DEFAULT_EXCHANGE for s in symbols}
-        try:
-            from vnstock_data import Reference
-            df = Reference().equity.list_by_exchange()
+        """Resolve exchanges with the unified API, then fall back to KBS listing.
+
+        The unified Reference domain may currently dispatch to VCI.  A transient
+        VCI response must not turn every otherwise valid symbol into UNKNOWN and
+        stop the whole quant run, so unresolved symbols are retried against the
+        KBS listing endpoint that is already used by the OHLCV fallback chain.
+        """
+        out = {str(s).upper(): 'UNKNOWN' for s in symbols}
+
+        def merge_listing(df):
             if df is None or df.empty:
-                return out
+                return
             sym_col = next((c for c in df.columns if str(c).lower() in ('symbol','ticker','code')), None)
             ex_col = next((c for c in df.columns if any(k in str(c).lower() for k in ('exchange','market','board'))), None)
             if sym_col is None or ex_col is None:
-                return out
+                return
             for _, row in df[[sym_col, ex_col]].dropna().iterrows():
                 sym = str(row[sym_col]).upper().strip()
-                if sym in out:
-                    out[sym] = VNMarketRules.normalize_exchange(row[ex_col])
+                if sym in out and out[sym] == 'UNKNOWN':
+                    exchange = VNMarketRules.normalize_exchange(row[ex_col])
+                    if exchange != 'UNKNOWN':
+                        out[sym] = exchange
+
+        try:
+            from vnstock_data import Reference
+            merge_listing(Reference().equity.list_by_exchange())
         except Exception as e:
-            log.warning(f'Không load được exchange map: {e}; fallback {CFG.DEFAULT_EXCHANGE}')
+            log.warning(f'Unified exchange map failed: {e}; trying KBS listing')
+
+        if any(exchange == 'UNKNOWN' for exchange in out.values()):
+            try:
+                from vnstock_data.explorer.kbs.listing import Listing as KBSListing
+                merge_listing(KBSListing().symbols_by_exchange(get_all=True))
+            except Exception as e:
+                log.warning(f'KBS exchange map failed: {e}')
+
+        unresolved = [symbol for symbol, exchange in out.items() if exchange == 'UNKNOWN']
+        if unresolved:
+            log.warning(f'Exchange unresolved for {len(unresolved)} symbols: {unresolved[:10]}')
         return out
 
-# ==============================================================
-# M0-B: SECTOR ENGINE — Nhóm ngành (ICB) + Xu hướng nhóm ngành
-# ==============================================================
-#
-# Nguồn: vnstock_data.Reference().equity.list_by_industry() (chuẩn ICB,
-# 4 cấp). Dùng ICB_LEVEL=2 (ngành cấp 2) — đủ khái quát để nhóm cổ phiếu,
-# không vụn như cấp 3/4.
-#
-# Xu hướng ngành = trung bình LOG-RETURN của các mã CÙNG NGÀNH trong danh
-# sách đang phân tích (không phải toàn thị trường). Dùng log-return vì nó
-# quy các mã về cùng "tốc độ tăng trưởng" (%), so sánh công bằng giữa các
-# mã có thị giá khác nhau, và cộng dồn được qua nhiều phiên (sum log-ret).
-# ==============================================================
+# M0-B: SECTOR ENGINE
 
 class SectorEngine:
     _icb_cache = None  # {symbol: icb_name} — cache 1 lần / process
@@ -914,9 +990,7 @@ class DistributionAnalyzer:
         }
         return r
 
-# ==============================================================
 # M2: RETURN STATISTICS
-# ==============================================================
 
 class StatEngine:
     @staticmethod
@@ -944,7 +1018,8 @@ class StatEngine:
         sharpe = ex / av if av > 0 else 0
         downside = np.sqrt(np.mean(np.minimum(ret.values, 0.0) ** 2)) * np.sqrt(252)
         sortino = ex / downside if downside > 0 else 0
-        wealth = (1 + ret).cumprod(); dd = wealth / wealth.cummax() - 1
+        wealth = pd.concat([pd.Series([1.0]), (1 + ret).reset_index(drop=True).cumprod()], ignore_index=True)
+        dd = wealth / wealth.cummax() - 1
         mdd = dd.min()
         calmar = cagr / abs(mdd) if mdd < 0 else 0
         kurt = ret.kurtosis()  # excess kurtosis
@@ -988,9 +1063,7 @@ class StatEngine:
         beh = 'MOMENTUM' if avg>th else ('MEAN_REVERSION' if avg<-th else 'RANDOM_WALK')
         return {'ac': ac, 'avg_short': round(avg,4), 'threshold': round(th,4), 'behavior': beh}
 
-# ==============================================================
 # M3: ARIMA
-# ==============================================================
 
 class ARIMAEngine:
     @staticmethod
@@ -1024,9 +1097,7 @@ class ARIMAEngine:
         r['forecast'] = {'prices': [round(p,0) for p in fp[1:]], 'returns_pct': [round(x*100,3) for x in fc]}
         return r
 
-# ==============================================================
 # M4: GARCH / EGARCH
-# ==============================================================
 
 class GARCHEngine:
     @staticmethod
@@ -1073,15 +1144,8 @@ class GARCHEngine:
         except Exception as e: r['egarch'] = {'error': str(e)}
         return r
 
-# ==============================================================
-# M5: HMM REGIME — V4: MULTIVARIATE + MULTI-INIT + BIC SELECT
-# ==============================================================
-#
-# FIX #2: Single-feature HMM too noisy for position trading.
-#   -> 4 features: [return, rolling_vol, volume_ratio, short_momentum]
-#   -> N random inits, select best model by BIC
-#   -> Robust state labeling via return-dimension ranking
-# ==============================================================
+
+# M5: HMM REGIME
 
 class HMMEngine:
     @staticmethod
@@ -1182,9 +1246,7 @@ class HMMEngine:
         st = '🟢 BULL' if p>m2>m5 and r20>0.02 else ('🔴 BEAR' if p<m2<m5 and r20<-0.02 else '🟡 SIDEWAY')
         return {'method': 'fallback', 'current': st, 'note': 'pip install hmmlearn cho HMM'}
 
-# ==============================================================
 # M6: ALPHA SIGNALS
-# ==============================================================
 
 class AlphaEngine:
     @staticmethod
@@ -1197,7 +1259,7 @@ class AlphaEngine:
         rsi = 100 - 100/(1+gain/loss.replace(0,1e-9)); crsi = rsi.iloc[-1]
         ema12, ema26 = c.ewm(span=12).mean(), c.ewm(span=26).mean()
         macd_h = (ema12-ema26) - (ema12-ema26).ewm(span=9).mean()
-        roc10 = (c.iloc[-1]/c.iloc[-10]-1)*100 if len(c)>=10 else 0
+        roc10 = (c.iloc[-1]/c.iloc[-11]-1)*100 if len(c)>=11 else 0
         ms = 0
         if crsi>70: ms-=0.3
         elif crsi<30: ms+=0.3
@@ -1209,15 +1271,10 @@ class AlphaEngine:
         else: ms-=0.2
         sig['momentum'] = {'rsi': round(float(crsi),1), 'roc_10d': round(roc10,2),
                           'macd_hist': round(float(macd_h.iloc[-1]),2), 'score': round(np.clip(ms,-1,1),3)}
-        ma20 = c.rolling(20).mean(); std20 = c.rolling(20).std()
-        z = (c.iloc[-1]-ma20.iloc[-1])/std20.iloc[-1] if std20.iloc[-1]>0 else 0
-        bb_u = ma20.iloc[-1]+2*std20.iloc[-1]; bb_l = ma20.iloc[-1]-2*std20.iloc[-1]
-        mrs = 0
-        if z>2: mrs-=0.5
-        elif z<-2: mrs+=0.5
-        elif abs(z)>1: mrs-=0.2*np.sign(z)
-        sig['mean_reversion'] = {'z_score': round(float(z),3), 'bb_upper': round(float(bb_u),0),
-                                 'bb_lower': round(float(bb_l),0), 'score': round(np.clip(mrs,-1,1),3)}
+        # V7: unconditional MA20 reversion was removed from alpha. Conditional
+        # factor-residual reversion is computed later with Hurst/HMM routing.
+        sig['mean_reversion'] = {'deprecated': True, 'score': 0.0,
+                                 'note': 'replaced_by_conditional_factor_residual_reversion'}
         obv = (np.sign(c.diff())*v).cumsum()
         obv_up = obv.iloc[-1]>obv.iloc[-20] if len(obv)>=20 else True
         vr = v.rolling(5).mean().iloc[-1] / v.rolling(20).mean().iloc[-1] if v.rolling(20).mean().iloc[-1]>0 else 1
@@ -1240,23 +1297,15 @@ class AlphaEngine:
                 else: beta, alpha_ann = 1, 0
                 sig['cross_sectional'] = {'rs_20d_pct': round(float(sr20)*100,2), 'beta': round(float(beta),3),
                                           'alpha_ann_pct': round(float(alpha_ann)*100,2)}
-        # Composite — weights = 0.4 + 0.3 + 0.3 = 1.0
-        cs = (0.4*sig.get('momentum',{}).get('score',0) +
-              0.3*sig.get('mean_reversion',{}).get('score',0) +
-              0.3*sig.get('volume',{}).get('score',0))
+        # Legacy technical composite remains a ranking aid only; Agreement V2
+        # uses the dedicated directional engines instead.
+        cs = (0.6*sig.get('momentum',{}).get('score',0) +
+              0.4*sig.get('volume',{}).get('score',0))
         sig['composite'] = {'alpha': round(cs,3),
                            'label': '🟢 BULLISH' if cs>0.3 else ('🔴 BEARISH' if cs<-0.3 else '⚪ NEUTRAL')}
         return sig
 
-# ==============================================================
-# M7: MARKET STRUCTURE — V4: SWING HIGH/LOW S/R
-# ==============================================================
-#
-# FIX #4: Histogram S/R finds price frequency, not turning points.
-#   -> argrelextrema for real swing high/low detection
-#   -> Cluster nearby levels within ATR distance
-#   -> Rank by touches + recency
-# ==============================================================
+# M7: MARKET STRUCTURE 
 
 class StructureEngine:
     @staticmethod
@@ -1324,15 +1373,427 @@ class StructureEngine:
         lb2 = ('🟢 MUA' if cmf>0.1 and bp>0.6 else '🔴 BAN' if cmf<-0.1 else '🟡 THIEN MANH' if cmf>0 else '🟡 THIEN YEU')
         return {'cmf': round(cmf,4), 'buy_p': round(bp,3), 'label': lb2}
 
-# ==============================================================
-# M8: FORECASTING — V4: GARCH-INFORMED MONTE CARLO
-# ==============================================================
-#
-# FIX #3: MC uses constant mu/sigma, ignoring GARCH forecast.
-#   -> Accept garch_result, extract h-step forecast vols
-#   -> Time-varying vol per simulation step
-#   -> Fallback to historical sigma if GARCH unavailable
-# ==============================================================
+
+# V7: DIRECTIONAL ALPHA + REGIME ROUTING
+
+class MomentumAlphaEngine:
+    """One multi-horizon momentum vote; avoids counting correlated horizons twice."""
+    WINDOWS = ((5, 0.20), (10, 0.35), (20, 0.30), (60, 0.15))
+
+    @classmethod
+    def analyze(cls, prices, horizon=None):
+        horizon = int(horizon or CFG.FORECAST_HORIZON)
+        p = pd.to_numeric(prices, errors='coerce').dropna().astype(float)
+        if len(p) < 65:
+            return {'signal': 'NEUTRAL', 'direction': 0, 'strength': 0.0,
+                    'proj_pct': 0.0, 'active': False, 'reason': 'need_65_obs'}
+        daily = p.pct_change().dropna()
+        vol20 = float(daily.tail(20).std(ddof=1))
+        components = {}
+        raw_score = 0.0; projected = 0.0
+        for window, weight in cls.WINDOWS:
+            ret = float(p.iloc[-1] / p.iloc[-window-1] - 1)
+            scale = max(vol20 * np.sqrt(window), 1e-6)
+            normalized = float(np.tanh(ret / scale))
+            raw_score += weight * normalized
+            projected += weight * ((1.0 + ret) ** (horizon / window) - 1.0)
+            components[f'ret_{window}d_pct'] = round(ret * 100, 3)
+
+        tail = np.log(p.tail(21).values)
+        x = np.arange(len(tail), dtype=float)
+        coef = np.polyfit(x, tail, 1); fitted = np.polyval(coef, x)
+        ss_tot = float(np.sum((tail - tail.mean()) ** 2))
+        r2 = 1.0 - float(np.sum((tail - fitted) ** 2)) / ss_tot if ss_tot > 0 else 0.0
+        change = abs(float(p.iloc[-1] - p.iloc[-21]))
+        path = float(p.tail(21).diff().abs().sum())
+        efficiency = change / path if path > 0 else 0.0
+        trend_quality = np.sign(coef[0]) * np.sqrt(max(r2, 0.0)) * efficiency
+        score = float(np.clip(0.80 * raw_score + 0.20 * trend_quality, -1.0, 1.0))
+        direction = 1 if score > 0.15 else (-1 if score < -0.15 else 0)
+        strength = float(np.clip((abs(score) - 0.10) / 0.70, 0.0, 1.0)) if direction else 0.0
+        signal = 'BULLISH' if direction > 0 else ('BEARISH' if direction < 0 else 'NEUTRAL')
+        return {
+            'signal': signal, 'direction': direction, 'strength': round(strength, 4),
+            'score': round(score, 4), 'proj_pct': round(float(np.clip(projected * 100, -20, 20)), 3),
+            'active': bool(direction), 'trend_r2': round(r2, 4),
+            'trend_efficiency': round(efficiency, 4), 'components': components,
+        }
+
+
+class HurstRegimeEngine:
+    """Estimate persistence on returns; Hurst routes weights and never votes direction."""
+
+    @staticmethod
+    def _estimate(values):
+        x = np.asarray(values, dtype=float)
+        x = x[np.isfinite(x)]
+        if len(x) < 48 or np.std(x) <= 1e-12:
+            return None
+        sizes = [n for n in (8, 16, 32, 64) if n <= len(x) // 2]
+        points = []
+        for size in sizes:
+            rs_values = []
+            for start in range(0, len(x) - size + 1, size):
+                segment = x[start:start + size]
+                centered = segment - segment.mean()
+                spread = np.cumsum(centered)
+                denom = segment.std(ddof=1)
+                if denom > 1e-12:
+                    rs_values.append((spread.max() - spread.min()) / denom)
+            if rs_values and np.mean(rs_values) > 0:
+                points.append((size, float(np.mean(rs_values))))
+        if len(points) < 2:
+            return None
+        lx = np.log([p[0] for p in points]); ly = np.log([p[1] for p in points])
+        slope, intercept = np.polyfit(lx, ly, 1)
+        fitted = slope * lx + intercept
+        denom = np.sum((ly - ly.mean()) ** 2)
+        r2 = 1.0 - np.sum((ly - fitted) ** 2) / denom if denom > 0 else 0.0
+        return float(np.clip(slope, 0.0, 1.0)), float(np.clip(r2, 0.0, 1.0))
+
+    @classmethod
+    def analyze(cls, prices):
+        returns = pd.to_numeric(prices, errors='coerce').pct_change().dropna().values
+        estimates = []
+        for window in (64, 128, 252):
+            if len(returns) >= min(window, 48):
+                result = cls._estimate(returns[-window:])
+                if result is not None:
+                    estimates.append({'window': min(window, len(returns)), 'hurst': result[0], 'r2': result[1]})
+        if not estimates:
+            return {'hurst': 0.5, 'regime': 'UNCERTAIN', 'confidence': 0.0,
+                    'method': 'multi_window_rs_returns', 'windows': []}
+        h_values = np.array([x['hurst'] for x in estimates]); r2_values = np.array([x['r2'] for x in estimates])
+        hurst = float(np.median(h_values)); stability = float(np.clip(1.0 - 4.0 * np.std(h_values), 0.0, 1.0))
+        confidence = float(np.clip(stability * np.mean(r2_values), 0.0, 1.0))
+        if confidence < 0.35:
+            regime = 'UNCERTAIN'
+        elif hurst >= CFG.HURST_TREND_THRESHOLD:
+            regime = 'PERSISTENT'
+        elif hurst <= CFG.HURST_REVERSION_THRESHOLD:
+            regime = 'MEAN_REVERTING'
+        else:
+            regime = 'RANDOM_WALK'
+        return {'hurst': round(hurst, 4), 'regime': regime, 'confidence': round(confidence, 4),
+                'method': 'multi_window_rs_returns', 'windows': estimates}
+
+
+class ConditionalResidualReversionEngine:
+    """Factor-neutral reversal; active only in a range/reverting regime."""
+
+    @staticmethod
+    def analyze(df, idx_df=None, sector_returns=None, hurst=None, hmm=None, vni_regime='NEUTRAL'):
+        neutral = {'signal': 'NEUTRAL', 'direction': 0, 'strength': 0.0, 'proj_pct': 0.0,
+                   'active': False, 'method': 'factor_residual_reversion'}
+        if df is None or len(df) < 80:
+            return dict(neutral, reason='need_80_obs')
+        stock = pd.to_numeric(df['close'], errors='coerce').pct_change().rename('stock')
+        factors = []
+        if idx_df is not None and 'close' in idx_df:
+            market = pd.to_numeric(idx_df['close'], errors='coerce').pct_change().rename('market')
+            factors.append(market)
+        if sector_returns is not None:
+            factors.append(pd.Series(sector_returns, copy=False).rename('sector'))
+        if not factors:
+            return dict(neutral, reason='missing_market_sector_factors')
+        aligned = pd.concat([stock] + factors, axis=1).dropna().tail(180)
+        if len(aligned) < 60:
+            return dict(neutral, reason='insufficient_aligned_factors')
+        y = aligned['stock'].values
+        factor_cols = [c for c in aligned.columns if c != 'stock']
+        x = np.column_stack([np.ones(len(aligned))] + [aligned[c].values for c in factor_cols])
+        try:
+            beta = np.linalg.lstsq(x, y, rcond=None)[0]
+        except np.linalg.LinAlgError:
+            return dict(neutral, reason='residual_regression_failed')
+        residual = pd.Series(y - x @ beta, index=aligned.index)
+        residual_5d = residual.rolling(5).sum().dropna()
+        if len(residual_5d) < 30:
+            return dict(neutral, reason='insufficient_residual_history')
+        current = float(residual_5d.iloc[-1]); median = float(residual_5d.median())
+        mad = float(np.median(np.abs(residual_5d.values - median)))
+        robust_scale = max(1.4826 * mad, float(residual_5d.std(ddof=1)) * 0.5, 1e-6)
+        z = float((current - median) / robust_scale)
+
+        close = pd.to_numeric(df['close'], errors='coerce').dropna()
+        tail = close.tail(21)
+        path = float(tail.diff().abs().sum()); change = abs(float(tail.iloc[-1] - tail.iloc[0]))
+        efficiency = change / path if path > 0 else 0.0
+        hurst = hurst or {}; hmm = hmm or {}; state_probs = hmm.get('state_probs', {})
+        sideway_prob = float(state_probs.get('SIDEWAY', 0) or 0) / 100.0
+        regime_support = hurst.get('regime') == 'MEAN_REVERTING' or sideway_prob >= 0.55
+        active = bool(abs(z) >= CFG.CONDITIONAL_MR_Z_MIN and regime_support and efficiency < 0.45
+                      and vni_regime not in ('CRISIS', 'UNKNOWN'))
+        direction = -int(np.sign(z)) if active else 0
+        strength = float(np.clip((abs(z) - CFG.CONDITIONAL_MR_Z_MIN) / 1.75, 0.0, 1.0)) if active else 0.0
+        projected = float(np.clip(-0.5 * current * 100, -10.0, 10.0)) if active else 0.0
+        coefficients = {'intercept': round(float(beta[0]), 6)}
+        coefficients.update({name: round(float(beta[i + 1]), 4) for i, name in enumerate(factor_cols)})
+        return {
+            'signal': 'UP' if direction > 0 else ('DOWN' if direction < 0 else 'NEUTRAL'),
+            'direction': direction, 'strength': round(strength, 4), 'proj_pct': round(projected, 3),
+            'active': active, 'residual_z': round(z, 4), 'residual_5d_pct': round(current * 100, 3),
+            'trend_efficiency': round(efficiency, 4), 'sideway_probability': round(sideway_prob, 4),
+            'hurst_regime': hurst.get('regime', 'UNCERTAIN'), 'coefficients': coefficients,
+            'method': 'factor_residual_reversion',
+            'reason': 'active' if active else 'regime_or_extreme_not_confirmed',
+        }
+
+
+class CrossSectionalLightGBMEngine:
+    """Pooled point-in-time LightGBM models for 10-session absolute and relative returns."""
+    FEATURE_COLUMNS = [
+        'ret_1d', 'ret_5d', 'ret_10d', 'ret_20d', 'ret_60d', 'vol_10d', 'vol_20d',
+        'downside_20d', 'atr_14_pct', 'range_pos_20d', 'volume_ratio_5_20',
+        'value_ratio_5_20', 'cmf_20', 'market_ret_5d', 'market_ret_20d',
+        'sector_ret_5d', 'sector_ret_20d', 'excess_market_20d', 'excess_sector_20d',
+    ]
+
+    @staticmethod
+    def sector_return_series(data, sector_map):
+        groups = {}
+        for symbol, sector in sector_map.items():
+            frame = data.get(symbol)
+            if frame is None or 'close' not in frame or len(frame) < 30:
+                continue
+            groups.setdefault(sector, {})[symbol] = pd.to_numeric(frame['close'], errors='coerce').pct_change()
+        return {sector: pd.DataFrame(series).mean(axis=1, skipna=True).sort_index()
+                for sector, series in groups.items() if series}
+
+    @classmethod
+    def _feature_frame(cls, df, market_returns=None, sector_returns=None, horizon=None):
+        horizon = int(horizon or CFG.FORECAST_HORIZON)
+        c = pd.to_numeric(df['close'], errors='coerce').astype(float)
+        h = pd.to_numeric(df['high'], errors='coerce').astype(float)
+        l = pd.to_numeric(df['low'], errors='coerce').astype(float)
+        v = pd.to_numeric(df['volume'], errors='coerce').astype(float)
+        r = c.pct_change()
+        out = pd.DataFrame(index=df.index)
+        for window in (1, 5, 10, 20, 60):
+            out[f'ret_{window}d'] = c.pct_change(window)
+        out['vol_10d'] = r.rolling(10).std()
+        out['vol_20d'] = r.rolling(20).std()
+        out['downside_20d'] = r.clip(upper=0).pow(2).rolling(20).mean().pow(0.5)
+        tr = pd.concat([(h-l), (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+        out['atr_14_pct'] = tr.rolling(14).mean() / c.replace(0, np.nan)
+        low20 = l.rolling(20).min(); high20 = h.rolling(20).max()
+        out['range_pos_20d'] = (c - low20) / (high20 - low20).replace(0, np.nan)
+        out['volume_ratio_5_20'] = v.rolling(5).mean() / v.rolling(20).mean().replace(0, np.nan)
+        value = c * v
+        out['value_ratio_5_20'] = value.rolling(5).mean() / value.rolling(20).mean().replace(0, np.nan)
+        money_mult = ((c-l) - (h-c)) / (h-l).replace(0, np.nan)
+        out['cmf_20'] = (money_mult*v).rolling(20).sum() / v.rolling(20).sum().replace(0, np.nan)
+
+        market_returns = pd.Series(dtype=float) if market_returns is None else pd.Series(market_returns, copy=False)
+        sector_returns = pd.Series(dtype=float) if sector_returns is None else pd.Series(sector_returns, copy=False)
+        market_price = (1 + market_returns.reindex(out.index).fillna(0)).cumprod()
+        sector_price = (1 + sector_returns.reindex(out.index).fillna(0)).cumprod()
+        out['market_ret_5d'] = market_price.pct_change(5)
+        out['market_ret_20d'] = market_price.pct_change(20)
+        out['sector_ret_5d'] = sector_price.pct_change(5)
+        out['sector_ret_20d'] = sector_price.pct_change(20)
+        out['excess_market_20d'] = out['ret_20d'] - out['market_ret_20d']
+        out['excess_sector_20d'] = out['ret_20d'] - out['sector_ret_20d']
+        out['target_abs_pct'] = (c.shift(-horizon) / c - 1) * 100
+        market_forward = (market_price.shift(-horizon) / market_price - 1) * 100
+        sector_forward = (sector_price.shift(-horizon) / sector_price - 1) * 100
+        out['target_alpha_pct'] = out['target_abs_pct'] - 0.5*market_forward - 0.5*sector_forward
+        return out.replace([np.inf, -np.inf], np.nan)
+
+    @classmethod
+    def fit_predict(cls, data, sector_map, idx_df=None, horizon=None):
+        horizon = int(horizon or CFG.FORECAST_HORIZON)
+        try:
+            from lightgbm import LGBMRegressor
+        except ImportError:
+            return {}, {'available': False, 'reason': 'lightgbm_not_installed'}
+        if len(data) < CFG.LIGHTGBM_MIN_SYMBOLS:
+            return {}, {'available': False, 'reason': 'insufficient_symbol_universe', 'n_symbols': len(data)}
+        market_returns = None
+        if idx_df is not None and 'close' in idx_df:
+            market_returns = pd.to_numeric(idx_df['close'], errors='coerce').pct_change()
+        sector_returns = cls.sector_return_series(data, sector_map)
+        historical = []; current = []
+        for symbol, df in data.items():
+            if df is None or len(df) < 80:
+                continue
+            sector = sector_map.get(symbol, 'Không xác định')
+            features = cls._feature_frame(df, market_returns, sector_returns.get(sector), horizon)
+            labelled = features.dropna(subset=cls.FEATURE_COLUMNS + ['target_abs_pct', 'target_alpha_pct']).copy()
+            if not labelled.empty:
+                labelled['symbol'] = symbol; labelled['date'] = labelled.index
+                historical.append(labelled)
+            live = features.dropna(subset=cls.FEATURE_COLUMNS)
+            if not live.empty:
+                row = live.iloc[[-1]].copy(); row['symbol'] = symbol; row['date'] = live.index[-1]
+                current.append(row)
+        if not historical or not current:
+            return {}, {'available': False, 'reason': 'no_complete_feature_rows'}
+        train = pd.concat(historical, ignore_index=True)
+        live = pd.concat(current, ignore_index=True)
+        if len(train) < CFG.LIGHTGBM_MIN_TRAIN_ROWS:
+            return {}, {'available': False, 'reason': 'insufficient_training_rows', 'training_rows': len(train)}
+
+        params = dict(n_estimators=180, learning_rate=0.035, num_leaves=15, max_depth=4,
+                      min_child_samples=35, subsample=0.85, colsample_bytree=0.85,
+                      reg_alpha=0.2, reg_lambda=1.0, random_state=42, n_jobs=-1, verbosity=-1)
+        x = train[cls.FEATURE_COLUMNS].astype(float)
+        y_abs = train['target_abs_pct'].clip(-30, 30).astype(float)
+        y_alpha = train['target_alpha_pct'].clip(-30, 30).astype(float)
+        model_abs = LGBMRegressor(**params); model_alpha = LGBMRegressor(**params)
+
+        metrics = {}
+        unique_dates = np.array(sorted(pd.to_datetime(train['date']).unique()))
+        if len(unique_dates) >= 50:
+            split = int(len(unique_dates) * 0.80)
+            train_end = max(split - horizon, 1)
+            train_dates = set(unique_dates[:train_end]); valid_dates = set(unique_dates[split:])
+            tr_mask = pd.to_datetime(train['date']).isin(train_dates)
+            va_mask = pd.to_datetime(train['date']).isin(valid_dates)
+            if tr_mask.sum() >= 200 and va_mask.sum() >= 50:
+                validation_model = LGBMRegressor(**params)
+                validation_model.fit(x.loc[tr_mask], y_alpha.loc[tr_mask])
+                validation = train.loc[va_mask, ['date', 'target_alpha_pct']].copy()
+                validation['prediction'] = validation_model.predict(x.loc[va_mask])
+                rank_ics = []
+                for _, group in validation.groupby('date'):
+                    if len(group) >= 3:
+                        corr = group['prediction'].corr(group['target_alpha_pct'], method='spearman')
+                        if pd.notna(corr): rank_ics.append(float(corr))
+                metrics = {
+                    'validation_rows': int(va_mask.sum()),
+                    'validation_rank_ic': round(float(np.mean(rank_ics)), 4) if rank_ics else None,
+                    'validation_mae_alpha_pct': round(float(np.mean(np.abs(validation['prediction']-validation['target_alpha_pct']))), 4),
+                    'purge_sessions': horizon,
+                }
+
+        model_abs.fit(x, y_abs); model_alpha.fit(x, y_alpha)
+        live_x = live[cls.FEATURE_COLUMNS].astype(float)
+        live['predicted_abs_ret_pct'] = model_abs.predict(live_x)
+        live['predicted_alpha_pct'] = model_alpha.predict(live_x)
+        live['rank_pct'] = live['predicted_alpha_pct'].rank(method='average', pct=True) * 100
+        predictions = {}
+        for _, row in live.iterrows():
+            pred_abs = float(row['predicted_abs_ret_pct']); pred_alpha = float(row['predicted_alpha_pct'])
+            rank_pct = float(row['rank_pct'])
+            direction = 1 if pred_abs > CFG.ALPHA_NEUTRAL_RET_PCT and pred_alpha > 0 and rank_pct >= 60 else (
+                -1 if pred_abs < -CFG.ALPHA_NEUTRAL_RET_PCT and pred_alpha < 0 and rank_pct <= 40 else 0)
+            rank_strength = abs(rank_pct - 50) / 50
+            return_strength = min(abs(pred_abs) / 5.0, 1.0)
+            strength = float(np.clip(0.6*rank_strength + 0.4*return_strength, 0, 1)) if direction else 0.0
+            predictions[str(row['symbol'])] = {
+                'available': True, 'signal': 'UP' if direction > 0 else ('DOWN' if direction < 0 else 'NEUTRAL'),
+                'direction': direction, 'strength': round(strength, 4), 'active': bool(direction),
+                'predicted_abs_ret_pct': round(pred_abs, 3), 'predicted_alpha_pct': round(pred_alpha, 3),
+                'rank_pct': round(rank_pct, 2), 'proj_pct': round(pred_abs, 3),
+                'as_of': str(pd.Timestamp(row['date']).date()), 'model': 'lightgbm_cross_sectional',
+            }
+        info = {'available': True, 'model': 'LightGBM', 'training_rows': len(train),
+                'n_symbols': int(live['symbol'].nunique()), 'feature_count': len(cls.FEATURE_COLUMNS), **metrics}
+        return predictions, info
+
+
+class AgreementEngine:
+    """Combine directional alpha only. Risk and regime models never cast direction votes."""
+
+    @staticmethod
+    def combine(distribution, momentum, lightgbm, conditional_mr, hurst, hmm, vni_regime='NEUTRAL'):
+        distribution = dict(distribution or {})
+        momentum = momentum or {}; lightgbm = lightgbm or {}; conditional_mr = conditional_mr or {}
+        hurst = hurst or {}; hmm = hmm or {}
+        components = {
+            'momentum': momentum,
+            'lightgbm_cross_sectional': lightgbm,
+            'conditional_residual_reversion': conditional_mr,
+        }
+        weights = {
+            'momentum': CFG.MOMENTUM_ALPHA_WEIGHT,
+            'lightgbm_cross_sectional': CFG.LIGHTGBM_ALPHA_WEIGHT,
+            'conditional_residual_reversion': CFG.CONDITIONAL_MR_WEIGHT,
+        }
+        if hurst.get('regime') == 'PERSISTENT':
+            weights['momentum'] *= 1.25; weights['conditional_residual_reversion'] = 0.0
+        elif hurst.get('regime') == 'MEAN_REVERTING':
+            weights['momentum'] *= 0.75; weights['conditional_residual_reversion'] *= 1.50
+        probs = hmm.get('state_probs', {})
+        trend_prob = (float(probs.get('BULL', 0) or 0) + float(probs.get('BEAR', 0) or 0)) / 100.0
+        side_prob = float(probs.get('SIDEWAY', 0) or 0) / 100.0
+        weights['momentum'] *= 0.75 + 0.50*trend_prob
+        weights['conditional_residual_reversion'] *= 0.50 + side_prob
+
+        total_weight = sum(weights.values()) or 1.0
+        active = {name: value for name, value in components.items()
+                  if weights.get(name, 0) > 0
+                  and int(value.get('direction', 0) or 0) != 0
+                  and float(value.get('strength', 0) or 0) > 0}
+        active_weight = sum(weights[name] for name in active)
+        vote_score = sum(weights[name] * int(value['direction']) * float(value['strength'])
+                         for name, value in active.items())
+        forecast_numerator = sum(weights[name] * float(value.get('proj_pct', 0) or 0)
+                                 for name, value in active.items())
+        forecast_ret = forecast_numerator / active_weight if active_weight > 0 else 0.0
+        vote_direction = 1 if vote_score > 0 else (-1 if vote_score < 0 else 0)
+        ret_direction = 1 if forecast_ret > CFG.ALPHA_NEUTRAL_RET_PCT else (
+            -1 if forecast_ret < -CFG.ALPHA_NEUTRAL_RET_PCT else 0)
+        direction = vote_direction if vote_direction == ret_direction else 0
+        matching_weight = sum(weights[name] for name, value in active.items()
+                              if int(value.get('direction', 0)) == direction) if direction else 0.0
+        agreement = matching_weight / active_weight * 100 if active_weight > 0 and direction else 0.0
+        coverage = active_weight / total_weight * 100
+        support = abs(vote_score) / total_weight * 100
+        active_count = len(active)
+        signal_strong = bool(
+            direction > 0 and forecast_ret > 2.0
+            and active_count >= CFG.AGREEMENT_MIN_ACTIVE_MODELS
+            and coverage >= CFG.AGREEMENT_MIN_COVERAGE_PCT
+            and agreement >= CFG.AGREEMENT_MIN_PCT
+            and support >= CFG.AGREEMENT_MIN_SUPPORT_PCT
+        )
+
+        if vni_regime == 'CRISIS':
+            forecast_ret = float(np.clip(forecast_ret, -CFG.FORECAST_CAP_CRISIS*3, CFG.FORECAST_CAP_CRISIS))
+        elif vni_regime == 'BEAR':
+            forecast_ret = float(np.clip(forecast_ret, -20, CFG.FORECAST_CAP_CRISIS*2))
+        lock = distribution.get('lock_risk', {})
+        lock_safe = float(lock.get('prob_loss_gt_3pct', 100) or 100) < 20
+        if direction <= 0 or vni_regime in ('UNKNOWN', 'CRISIS'):
+            timing_status = 'BLOCKED'
+        elif vni_regime in ('BEAR', 'WEAK') or not signal_strong or not lock_safe:
+            timing_status = 'WATCH'
+        else:
+            timing_status = 'READY'
+        timing = {
+            'READY': '🟢 SẴN SÀNG — directional alpha mạnh, coverage đủ và T-lock đạt',
+            'WATCH': '🟡 THEO DÕI — directional alpha có tín hiệu nhưng regime/coverage/risk chưa đủ',
+            'BLOCKED': '🔴 KHÔNG VÀO — directional alpha hoặc hard regime chưa ủng hộ',
+        }[timing_status]
+        consensus = '📈 TANG' if direction > 0 else ('📉 GIAM' if direction < 0 else '↔️ TRUNG LAP')
+        last_price = float(distribution.get('last_price', 0) or 0)
+        component_returns = {
+            'momentum_ret_pct': float(momentum.get('proj_pct', 0) or 0),
+            'lightgbm_ret_pct': float(lightgbm.get('proj_pct', 0) or 0),
+            'conditional_mr_ret_pct': float(conditional_mr.get('proj_pct', 0) or 0),
+            'mc_distribution_mean_ret_pct': float(distribution.get('mc_distribution_mean_ret_pct', 0) or 0),
+        }
+        distribution.update({
+            'weights': {k: round(v/total_weight, 4) for k, v in weights.items()},
+            'component_returns': component_returns,
+            'directional_components': components, 'hurst': hurst,
+            'ensemble_uncapped_ret_pct': round(forecast_numerator / active_weight, 4) if active_weight else 0.0,
+            'ensemble_ret_pct': round(forecast_ret, 2),
+            'ensemble_price': round(last_price*(1+forecast_ret/100), 0) if last_price > 0 else None,
+            'consensus': consensus, 'ensemble_direction': 'UP' if direction > 0 else ('DOWN' if direction < 0 else 'NEUTRAL'),
+            'agreement_pct': round(agreement, 1), 'coverage_pct': round(coverage, 1),
+            'support_pct': round(support, 1), 'confidence': round(agreement, 1),
+            'active_models': active_count, 'total_models': len(components),
+            'active_model_names': list(active), 'calibrated_prob_up': None,
+            'meta_trust_probability': None, 'meta_status': 'WARMUP',
+            'timing': timing, 'timing_status': timing_status, 'signal_strong': signal_strong,
+        })
+        return distribution
+
+# M8: DISTRIBUTION RISK — GARCH-INFORMED MONTE CARLO
+
 
 class FcastEngine:
     @staticmethod
@@ -1349,7 +1810,9 @@ class FcastEngine:
         sym_seed = int.from_bytes(hashlib.blake2b(str(symbol).encode('utf-8'), digest_size=4).digest(), 'little') if symbol else 42
         rng = np.random.RandomState(sym_seed)
 
-        H = CFG.SWING_DEFAULT; LOCK = CFG.MIN_HOLD_SESSIONS; N = CFG.MONTE_CARLO_SIMS
+        H = int(CFG.FORECAST_HORIZON); LOCK = CFG.MIN_HOLD_SESSIONS; N = CFG.MONTE_CARLO_SIMS
+        if H < LOCK or H < 1:
+            raise ValueError('FORECAST_HORIZON must cover the settlement lock window')
 
         # V4.1 FIX #2: Extract GARCH forecast vols with sanity bounds
         garch_vols = None
@@ -1449,102 +1912,17 @@ class FcastEngine:
             'ci_lo_unlock': round(np.percentile(unlock_prices, 10), 0),
             'ci_hi_unlock': round(np.percentile(unlock_prices, 90), 0),
         }
-        ma20 = prices.rolling(20).mean(); std20 = prices.rolling(20).std()
-        z = (lp-ma20.iloc[-1])/std20.iloc[-1] if std20.iloc[-1]>0 else 0
-        mr_target = ma20.iloc[-1]
-        mr_sessions = min(H, max(LOCK+1, int(abs(z)*3)))
-        mr = {'z': round(z,3), 'target': round(mr_target,0), 'dir': 'DOWN' if z>0 else 'UP', 'est_sessions': mr_sessions}
-        rd = prices.pct_change().tail(H); avg = rd.mean()
-        ms = avg/rd.std() if rd.std()>0 else 0
-        mom = {'strength': round(ms,3), 'proj_pct': round(avg*H*100,2),
-               'signal': 'BULLISH' if ms>0.3 else ('BEARISH' if ms<-0.3 else 'NEUTRAL')}
-
-        # V4.1 FIX #7: Balanced weights — prevent auto-switch to MR after crash
-        # In crisis/bear: momentum gets MORE weight (trend-following, not mean-reverting)
-        msa = abs(ms); za = abs(z)
-        if vni_regime in ('CRISIS', 'BEAR'):
-            # In downtrend: trust momentum > MR, MC as base
-            w = (0.35, 0.15, 0.50)
-        elif msa > 0.5:
-            w = (0.30, 0.20, 0.50)
-        elif za > 1.5:
-            # Only trust MR in non-crisis environments
-            w = (0.30, 0.45, 0.25)
-        else:
-            w = (0.50, 0.25, 0.25)
-
-        mc_r = (np.mean(fin)/lp-1)*100; mr_r = (mr_target-lp)/lp*100; mom_r = avg*H*100
-        er = w[0]*mc_r + w[1]*mr_r + w[2]*mom_r
-        uncapped_er = er
-
-        # V4.1: Cap forecast in crisis regime
-        if vni_regime == 'CRISIS':
-            er = np.clip(er, -CFG.FORECAST_CAP_CRISIS * 3, CFG.FORECAST_CAP_CRISIS)
-        elif vni_regime == 'BEAR':
-            er = np.clip(er, -20, CFG.FORECAST_CAP_CRISIS * 2)
-
-        cons = '📈 TANG' if er > 0.5 else ('📉 GIAM' if er < -0.5 else '↔️ TRUNG LAP')
-        dirs = []
-        if mc['prob_up']>55: dirs.append('UP')
-        elif mc['prob_up']<45: dirs.append('DOWN')
-        if mr['dir']=='UP': dirs.append('UP')
-        else: dirs.append('DOWN')
-        if mom['signal']=='BULLISH': dirs.append('UP')
-        elif mom['signal']=='BEARISH': dirs.append('DOWN')
-        er_dir = 'UP' if er > 0 else 'DOWN'
-        agree = sum(1 for d in dirs if d == er_dir)
-        conf = agree/len(dirs)*100 if dirs else 33
-        lock_safe = lock_risk['prob_loss_gt_3pct'] < 20
-        signal_strong = abs(er) > 2 and conf >= 66
-
-        # V4.1 FIX #3: Timing MUST respect VNI regime — circuit breaker
-        if vni_regime == 'CRISIS':
-            timing = '🔴 KHÔNG VÀO — CRISIS: thị trường đang trong trạng thái khẩn cấp'
-        elif vni_regime == 'BEAR':
-            # In BEAR: never VÀO NGAY, at most CHỜ PULLBACK
-            if signal_strong and lock_safe:
-                timing = '🟡 CHỜ PULLBACK — tín hiệu tốt nhưng VNI đang BEAR'
-            elif signal_strong:
-                timing = '🟡 CHỜ PULLBACK — tín hiệu tốt nhưng lock risk cao + VNI BEAR'
-            elif lock_safe:
-                timing = '🟡 THEO DÕI — lock an toàn nhưng tín hiệu yếu + VNI BEAR'
-            else:
-                timing = '🔴 KHÔNG VÀO — lock risk cao + tín hiệu yếu + VNI BEAR'
-        else:
-            # Original logic for NEUTRAL/BULL/WEAK
-            if signal_strong and lock_safe:
-                timing = '🟢 VÀO NGAY — lock risk thấp, tín hiệu mạnh'
-            elif signal_strong and not lock_safe:
-                timing = '🟡 CHỜ PULLBACK — tín hiệu tốt nhưng lock risk cao'
-            elif not signal_strong and lock_safe:
-                timing = '🟡 THEO DÕI — lock an toàn nhưng tín hiệu yếu'
-            else:
-                timing = '🔴 KHÔNG VÀO — lock risk cao + tín hiệu yếu'
-
-        # V4.1 FIX #10: Hold plan with regime awareness
-        if vni_regime in ('CRISIS', 'BEAR'):
-            hold_plan = CFG.SWING_HORIZON_MIN  # Minimize exposure
-        elif 'TANG' in cons and ms > 0.3:
-            hold_plan = CFG.SWING_HORIZON_MAX
-        elif 'TANG' in cons:
-            hold_plan = CFG.SWING_DEFAULT
-        else:
-            hold_plan = CFG.SWING_HORIZON_MIN
-
         # ── MC path summary for Forecast chart export ──
         mc_median_path = np.median(sims, axis=0).tolist()
         mc_ci_upper = np.percentile(sims, 97.5, axis=0).tolist()
         mc_ci_lower = np.percentile(sims, 2.5, axis=0).tolist()
 
         return {
-            'weights': dict(zip(('mc', 'mean_reversion', 'momentum'), w)),
-            'component_returns': {'mc_ret_pct': float(mc_r), 'mr_ret_pct': float(mr_r), 'mom_ret_pct': float(mom_r)},
-            'ensemble_uncapped_ret_pct': float(uncapped_er),
-            'ensemble_ret_pct': round(er,2), 'ensemble_price': round(lp*(1+er/100),0),
-            'consensus': cons, 'confidence': round(conf,0), 'agreement_pct': round(conf,0), 'calibrated_prob_up': None, 'horizon': H,
-            'mc': mc, 'mr': mr, 'mom': mom, 'lock_risk': lock_risk, 'unlock': unlock,
-            'timing': timing, 'hold_plan_sessions': hold_plan,
-            'hold_plan_label': f'{hold_plan} phien (~{round(hold_plan*7/5)} ngay)',
+            'distribution_only': True, 'last_price': float(lp),
+            'mc_distribution_mean_ret_pct': round(float((np.mean(fin)/lp-1)*100), 3),
+            'horizon': H, 'mc': mc, 'lock_risk': lock_risk, 'unlock': unlock,
+            'hold_plan_sessions': H,
+            'hold_plan_label': f'{H} phien (~{round(H*7/5)} ngay)',
             'mc_path': {'median': mc_median_path, 'upper': mc_ci_upper, 'lower': mc_ci_lower},
             '_mc_paths': sims,
         }
@@ -1786,19 +2164,24 @@ class RiskEng:
         #      (giam "tham vong", uu tien chot loi som) thay vi giu nguyen muc TP2 lac quan tu backtest.
         #    - Neu Confidence cao va EnsRet% ho tro huong TP2 goc thi giu nguyen.
         # ---------------------------------------------------------------
-        conf_pct = fc.get('confidence', 50)
+        meta_probability = fc.get('meta_trust_probability')
+        conf_pct = (float(meta_probability) * 100 if meta_probability is not None
+                    else float(fc.get('support_pct', 0) or 0))
         ens_ret_pct = fc.get('ensemble_ret_pct', 0)
-        conviction = max(0.0, min(1.0, (conf_pct - 33) / (100 - 33)))  # 0 khi conf<=33 (muc "tung dong xu")
+        # Meta probability is preferred once trained. During warm-up, weighted
+        # directional support is a conservative sizing proxy, not a win rate.
+        conviction = max(0.0, min(1.0, (conf_pct - 25) / 75))
         if ens_ret_pct <= 0:
             conviction *= 0.5  # mo hinh du bao khong ung ho chieu long -> giam tham vong TP hon nua
         tp2_adj = tp1_raw + conviction * (tp2_raw - tp1_raw)  # shrink TP2 ve TP1 khi conviction thap
 
         tp1 = RiskEng.tick_round(tp1_raw, 'up', exchange)
         tp2_before_cap = RiskEng.tick_round(tp2_adj, 'up', exchange)
-        tp2 = RiskEng.tick_round(min(tp2_before_cap, tp_realistic_cap), 'up', exchange) if tp_realistic_cap else tp2_before_cap
+        tp2 = RiskEng.tick_round(min(tp2_before_cap, tp_realistic_cap), 'down', exchange) if tp_realistic_cap else tp2_before_cap
         tp_was_capped = tp_realistic_cap is not None and tp2_before_cap > tp_realistic_cap
-        if tp2 <= tp1:
-            tp2 = RiskEng.tick_round(tp1_raw * 1.02, 'up', exchange)  # dam bao TP2 luon > TP1 sau moi buoc dieu chinh
+        if tp_realistic_cap is not None:
+            tp1 = min(tp1, RiskEng.tick_round(tp_realistic_cap, 'down', exchange))
+        plan_valid = 0 < sl_swing < e < tp1 < tp2
 
         # ---------------------------------------------------------------
         # 5) Xac suat thanh cong "blended": ket hop WinRate tu backtest (empirical, phu thuoc mau) voi
@@ -1807,7 +2190,7 @@ class RiskEng:
         #    tranh qua tin vao mau nho nhung cung khong bo qua tin hieu du bao hien tai.
         # ---------------------------------------------------------------
         # Agreement giữa mô hình KHÔNG phải xác suất thắng. Chỉ tính EV khi có xác suất đã calibration OOS.
-        calibrated_p = fc.get('calibrated_prob_up')
+        calibrated_p = fc.get('p_trade_win_calibrated')
         p_win_blended = float(calibrated_p) if calibrated_p is not None else None
         avg_r_win = RiskEng.TP1_EXIT_FRACTION * rr1 + (1 - RiskEng.TP1_EXIT_FRACTION) * (tp2 - e) / risk if risk > 0 else 0
         if p_win_blended is not None:
@@ -1816,7 +2199,9 @@ class RiskEng:
         else:
             ev_r = None; ev_vnd_per_share = None
         roundtrip_cost_vnd = e * float(costs.get('roundtrip_cost_pct', 0) or 0) / 100.0
-        rr_net_cost = ((tp2 - e) - roundtrip_cost_vnd) / risk if risk > 0 else 0
+        weighted_gain = RiskEng.TP1_EXIT_FRACTION * (tp1-e) + (1-RiskEng.TP1_EXIT_FRACTION) * (tp2-e)
+        rr_net_cost = (weighted_gain - roundtrip_cost_vnd) / (risk + roundtrip_cost_vnd) if risk > 0 else 0
+        plan_valid = plan_valid and weighted_gain > roundtrip_cost_vnd
 
         sl_wide  = RiskEng.tick_round(e - (k_sl+1)*a, 'down', exchange)
         sl_max   = RiskEng.tick_round(e - (k_sl+2)*a, 'down', exchange)
@@ -1840,7 +2225,7 @@ class RiskEng:
         lock_risk_flag = mae_lock < sl_pct_display  # Lock MAE is deeper than the displayed stop buffer.
 
         return {
-            'entry': round(e,2), 'atr': round(a,2),
+            'entry': round(e,2), 'atr': round(a,2), 'plan_valid': bool(plan_valid),
             'lock_sessions': CFG.MIN_HOLD_SESSIONS,
             'construction': {'atr_stop_pct': sl_atr_pct * 100, 'stop_floor_pct': sl_floor_pct * 100,
                              'base_tp2': tp2_raw, 'conviction_tp2': tp2_adj,
@@ -1860,7 +2245,8 @@ class RiskEng:
             'mfe_p90_pct': round(realistic_cap_pct, 2) if realistic_cap_pct else None,
             'conviction': round(conviction, 2),
             'p_win_backtest': round(wr_backtest*100, 1) if wr_backtest is not None else None,
-            'model_agreement_pct': round(conf_pct,1),
+            'model_agreement_pct': round(float(fc.get('agreement_pct', 0) or 0), 1),
+            'forecast_conviction_pct': round(conf_pct, 1),
             'p_win_blended': round(p_win_blended*100, 1) if p_win_blended is not None else None,
             'n_trades_backtest': n_trades,
             'ev_r_per_trade': round(ev_r, 3) if ev_r is not None else None,
@@ -1912,18 +2298,7 @@ class RiskEng:
         return {'full_pct':round(max(0,k)*100,2), 'half_pct':round(max(0,k/2)*100,2),
                 'edge_pct':round((p*b-q)*100,2), 'has_edge':bool(k>0)}
 
-# ==============================================================
-# ADAPTIVE SCORER — V4: CROSS-SECTIONAL Z-SCORE SCORING
-# ==============================================================
-#
-# FIX #5: Magic numbers replaced with z-score normalization.
-#   For each factor across N stocks in batch:
-#     z_i = (f_i - median) / IQR   [robust z-score]
-#     s_i = clip(z_i, -1, +1)      [bounded signal]
-#   composite = sum(w_i * s_i), sum(w_i) = 1
-#   final = 50 + composite * 40    [maps to ~[10,90]]
-#   + VNI regime multiplicative adjustment
-# ==============================================================
+# ADAPTIVE SCORER — CROSS-SECTIONAL Z-SCORE SCORING
 
 class AdaptiveScorer:
     WEIGHTS = {
@@ -1959,7 +2334,9 @@ class AdaptiveScorer:
         return {
             'sharpe': rs.get('sharpe', 0),
             'forecast_ret': costs.get('net_forecast_pct', fc.get('ensemble_ret_pct', 0)),
-            'forecast_conf': (fc.get('confidence', 50) - 50) / 50,
+            'forecast_conf': ((float(fc.get('meta_trust_probability')) * 2 - 1)
+                              if fc.get('meta_trust_probability') is not None
+                              else (float(fc.get('support_pct', 0) or 0) - 50) / 50),
             'cmf': fl.get('cmf', 0), 'trend_quality': trend_q,
             'alpha_composite': al.get('alpha', 0), 'hmm_regime': hmm_score,
             'lock_safety': (lock_safety - 50) / 50,
@@ -1981,7 +2358,10 @@ class AdaptiveScorer:
         factor_names = list(AdaptiveScorer.WEIGHTS.keys())
         factor_arrays = {fn: np.array([factor_data[s].get(fn,0) for s in symbols]) for fn in factor_names}
         scores = {}
-        vni_regime = AdaptiveScorer._detect_vni_regime(idx_df)
+        index_valid = (idx_df is not None and DataQualityEngine.audit(idx_df)['status'] != 'FAIL')
+        vni_regime = AdaptiveScorer._detect_vni_regime(idx_df) if index_valid else 'UNKNOWN'
+        if not index_valid:
+            idx_df = None
         regime_mult = {'BULL': 1.08, 'NEUTRAL': 1.00, 'WEAK': 0.92, 'BEAR': 0.85, 'CRISIS': 0.70}
 
         # V4.1 FIX #6: Compute absolute scores first for blending
@@ -2050,13 +2430,14 @@ class AdaptiveScorer:
 
     @staticmethod
     def _detect_vni_regime(idx_df):
-        if idx_df is None or 'close' not in idx_df.columns or len(idx_df)<50: return 'NEUTRAL'
+        if idx_df is None or 'close' not in idx_df.columns or len(idx_df)<50: return 'UNKNOWN'
         try:
-            c = idx_df['close']
+            c = pd.to_numeric(idx_df['close'], errors='coerce')
+            if not np.isfinite(c).all() or (c <= 0).any(): return 'UNKNOWN'
             ma20 = c.rolling(20).mean().iloc[-1]; ma50 = c.rolling(50).mean().iloc[-1]
             last = c.iloc[-1]
-            ret_20d = (last / c.iloc[-20] - 1) if len(c)>=20 else 0
-            ret_5d = (last / c.iloc[-5] - 1) if len(c)>=5 else 0
+            ret_20d = (last / c.iloc[-21] - 1) if len(c)>=21 else 0
+            ret_5d = (last / c.iloc[-6] - 1) if len(c)>=6 else 0
             ret_1d = (last / c.iloc[-2] - 1) if len(c)>=2 else 0
 
             # V4.1 FIX #4: CRISIS = extreme short-term damage
@@ -2074,18 +2455,136 @@ class AdaptiveScorer:
             elif last < ma20 < ma50 and ret_20d < -0.02: return 'BEAR'
             elif last < ma20 and ret_5d < -0.01: return 'WEAK'
             else: return 'NEUTRAL'
-        except: return 'NEUTRAL'
+        except: return 'UNKNOWN'
 
-# ==============================================================
-# ORCHESTRATOR — V4
-# ==============================================================
+
+class MetaLabelEngine:
+    """Regularized logistic gate trained only on previously observed trade outcomes."""
+    FEATURES = [
+        'agreement_pct', 'coverage_pct', 'support_pct', 'momentum_strength',
+        'lightgbm_strength', 'lightgbm_rank_pct', 'conditional_mr_strength',
+        'hurst', 'hmm_bull_prob', 'hmm_sideway_prob', 'hmm_bear_prob',
+        'mc_prob_loss_3', 'mc_lock_dd', 'liquidity_score', 'gap_p95_pct',
+        'roundtrip_cost_pct', 'net_forecast_pct',
+    ]
+
+    @classmethod
+    def report_features(cls, report):
+        fc = report.get('fcast', {}); comps = fc.get('directional_components', {})
+        mom = comps.get('momentum', {}); lgbm = comps.get('lightgbm_cross_sectional', {})
+        mr = comps.get('conditional_residual_reversion', {})
+        hmm_probs = report.get('hmm', {}).get('state_probs', {})
+        lock = fc.get('lock_risk', {}); liq = report.get('liquidity', {})
+        costs = report.get('costs', {})
+        return {
+            'agreement_pct': float(fc.get('agreement_pct', 0) or 0),
+            'coverage_pct': float(fc.get('coverage_pct', 0) or 0),
+            'support_pct': float(fc.get('support_pct', 0) or 0),
+            'momentum_strength': float(mom.get('strength', 0) or 0),
+            'lightgbm_strength': float(lgbm.get('strength', 0) or 0),
+            'lightgbm_rank_pct': float(lgbm.get('rank_pct', 50) or 50),
+            'conditional_mr_strength': float(mr.get('strength', 0) or 0),
+            'hurst': float(fc.get('hurst', {}).get('hurst', 0.5) or 0.5),
+            'hmm_bull_prob': float(hmm_probs.get('BULL', 0) or 0),
+            'hmm_sideway_prob': float(hmm_probs.get('SIDEWAY', 0) or 0),
+            'hmm_bear_prob': float(hmm_probs.get('BEAR', 0) or 0),
+            'mc_prob_loss_3': float(lock.get('prob_loss_gt_3pct', 50) or 50),
+            'mc_lock_dd': float(lock.get('max_dd_lock_pct', 0) or 0),
+            'liquidity_score': {'A': 1.0, 'B': 0.5, 'C': 0.0, 'D': -1.0}.get(liq.get('tier', 'D'), -1.0),
+            'gap_p95_pct': float(liq.get('gap_abs_p95_pct', 0) or 0),
+            'roundtrip_cost_pct': float(costs.get('roundtrip_cost_pct', 0) or 0),
+            'net_forecast_pct': float(costs.get('net_forecast_pct', 0) or 0),
+        }
+
+    @classmethod
+    def apply(cls, reports, filepath=None):
+        filepath = Path(filepath or CFG.FORECAST_LOG_PATH)
+        valid_reports = [r for r in reports if 'error' not in r and r.get('fcast')]
+        if not valid_reports:
+            return {'status': 'NO_REPORTS'}
+        model = None; metrics = {'status': 'WARMUP', 'training_samples': 0}
+        if filepath.exists():
+            try:
+                history = pd.read_csv(filepath)
+                required = set(cls.FEATURES + ['meta_label'])
+                if required.issubset(history.columns):
+                    history['meta_label'] = pd.to_numeric(history['meta_label'], errors='coerce')
+                    train = history.dropna(subset=cls.FEATURES + ['meta_label']).copy()
+                    if 'forecast_dir' in train.columns:
+                        train = train[train['forecast_dir'].astype(str).str.upper() == 'UP']
+                    train = train[train['meta_label'].isin([0, 1])]
+                    if len(train) >= CFG.META_LABEL_MIN_SAMPLES and train['meta_label'].nunique() == 2:
+                        from sklearn.impute import SimpleImputer
+                        from sklearn.linear_model import LogisticRegression
+                        from sklearn.metrics import brier_score_loss, roc_auc_score
+                        from sklearn.pipeline import Pipeline
+                        from sklearn.preprocessing import StandardScaler
+                        def make_model():
+                            return Pipeline([
+                                ('imputer', SimpleImputer(strategy='median')),
+                                ('scale', StandardScaler()),
+                                ('logit', LogisticRegression(C=0.5, class_weight='balanced', max_iter=500, random_state=42)),
+                            ])
+                        x = train[cls.FEATURES].astype(float); y = train['meta_label'].astype(int)
+                        validation = {}
+                        if 'run_date' in train.columns:
+                            order = pd.to_datetime(train['run_date'], format='mixed', errors='coerce').sort_values().index
+                            split = int(len(order) * 0.80)
+                            train_idx, valid_idx = order[:split], order[split:]
+                            if (len(valid_idx) >= 15 and y.loc[train_idx].nunique() == 2
+                                    and y.loc[valid_idx].nunique() == 2):
+                                validation_model = make_model()
+                                validation_model.fit(x.loc[train_idx], y.loc[train_idx])
+                                valid_probability = validation_model.predict_proba(x.loc[valid_idx])[:, 1]
+                                validation = {
+                                    'validation_samples': len(valid_idx),
+                                    'validation_brier': round(float(brier_score_loss(y.loc[valid_idx], valid_probability)), 4),
+                                    'validation_auc': round(float(roc_auc_score(y.loc[valid_idx], valid_probability)), 4),
+                                }
+                        model = make_model()
+                        model.fit(x, y)
+                        metrics = {'status': 'TRAINED', 'training_samples': len(train),
+                                   'positive_rate_pct': round(float(y.mean()*100), 2),
+                                   'features': len(cls.FEATURES), **validation}
+            except Exception as exc:
+                metrics = {'status': 'WARMUP', 'training_samples': 0, 'warning': str(exc)}
+
+        for report in valid_reports:
+            fc = report['fcast']
+            if model is None:
+                fc['meta_status'] = 'WARMUP'
+                fc['meta_trust_probability'] = None
+                fc['p_trade_win_calibrated'] = None
+                fc['meta_model'] = metrics
+                continue
+            feature_row = pd.DataFrame([cls.report_features(report)], columns=cls.FEATURES)
+            probability = float(model.predict_proba(feature_row)[0, 1])
+            fc['meta_status'] = 'TRAINED'; fc['meta_trust_probability'] = round(probability, 4)
+            # This is a trust gate, not yet a separately calibrated trade-win
+            # probability. Keep EV disabled until a calibration layer passes OOS.
+            fc['p_trade_win_calibrated'] = None; fc['meta_model'] = metrics
+            if fc.get('ensemble_direction') != 'UP':
+                fc['timing_status'] = 'BLOCKED'
+            elif probability < CFG.META_WATCH_PROB:
+                fc['timing_status'] = 'BLOCKED'
+                fc['timing'] = '🔴 KHÔNG VÀO — meta-label đánh giá Agreement không đáng tin ở bối cảnh hiện tại'
+            elif probability < CFG.META_READY_PROB or fc.get('timing_status') != 'READY':
+                fc['timing_status'] = 'WATCH'
+                fc['timing'] = '🟡 THEO DÕI — meta-label chưa đủ xác suất để vào ngay'
+            else:
+                fc['timing_status'] = 'READY'
+                fc['timing'] = '🟢 SẴN SÀNG — directional alpha, risk gate và meta-label cùng xác nhận'
+        return metrics
+
+# ORCHESTRATOR 
 
 class QuantPipeline:
     def __init__(self, cfg=None):
         self.cfg = cfg or CFG
-        log.info("QuantPipeline V6 VN initialized (DQ + liquidity + costs + action gate)")
+        log.info("QuantPipeline V7 VN initialized (directional alpha + regime routing + meta-label + risk)")
 
     def analyze(self, sym, df, sig=None, scores=None, idx_df=None, vni_regime='NEUTRAL', exchange='HOSE'):
+        df = _completed_daily_bars(df)
         if df is None or len(df)<30: return {'symbol':sym, 'error':'Insufficient data'}
         p = df['close']
         r = {'symbol':sym, 'exchange':VNMarketRules.normalize_exchange(exchange), 'date':datetime.now().strftime('%Y-%m-%d %H:%M'),
@@ -2093,11 +2592,17 @@ class QuantPipeline:
              'screener_signal':sig, 'screener_scores':scores,
              '_price_dates': df.index.tolist(), '_price_close': p.tolist()}
         log.info(f"  [{sym}] M0: Data quality + liquidity...")
+        if r['exchange'] == 'UNKNOWN':
+            r['error'] = 'Unknown exchange; cannot determine trading rules'
+            return r
         r['data_quality'] = DataQualityEngine.audit(df, exchange)
         if r['data_quality']['status'] == 'FAIL':
             r['error'] = 'Data quality failed: ' + ', '.join(r['data_quality']['flags'])
             return r
         r['liquidity'] = LiquidityEngine.analyze(df, exchange)
+        if not r['liquidity'].get('pass', False):
+            r['error'] = 'Liquidity gate failed'
+            return r
         log.info(f"  [{sym}] M1: Distribution..."); r['dist'] = DistributionAnalyzer.full_test(p)
         log.info(f"  [{sym}] M2: Statistics..."); r['stats'] = StatEngine.returns(p); r['vol'] = StatEngine.vol_regime(p); r['ac'] = StatEngine.autocorr(p)
         log.info(f"  [{sym}] M3: ARIMA..."); r['arima'] = ARIMAEngine.fit(p)
@@ -2106,8 +2611,20 @@ class QuantPipeline:
         log.info(f"  [{sym}] M5: HMM (multivariate)..."); r['hmm'] = HMMEngine.fit(df, symbol=sym)
         log.info(f"  [{sym}] M6: Alpha..."); r['alpha'] = AlphaEngine.extract(df, idx_df)
         log.info(f"  [{sym}] M7: Structure (swing SR)..."); r['sr'] = StructureEngine.sr_levels(df); r['trend'] = StructureEngine.trend(df); r['flow'] = StructureEngine.flow(df)
-        # V4.1: Pass GARCH result + symbol + VNI regime to MC
-        log.info(f"  [{sym}] M8: Forecast (GARCH-MC)..."); r['fcast'] = FcastEngine.ensemble(p, garch_result=r.get('garch'), symbol=sym, vni_regime=vni_regime)
+        # V7: Monte Carlo is distribution/risk only; directional alpha is separate.
+        log.info(f"  [{sym}] M8: Distribution risk (GARCH-MC) + directional alpha...")
+        distribution = FcastEngine.ensemble(p, garch_result=r.get('garch'), symbol=sym, vni_regime=vni_regime)
+        r['momentum_alpha'] = MomentumAlphaEngine.analyze(p)
+        r['hurst'] = HurstRegimeEngine.analyze(p)
+        r['conditional_mr'] = ConditionalResidualReversionEngine.analyze(
+            df, idx_df=idx_df, sector_returns=None, hurst=r['hurst'], hmm=r['hmm'], vni_regime=vni_regime)
+        r['lightgbm_cross_sectional'] = {
+            'available': False, 'signal': 'NEUTRAL', 'direction': 0, 'strength': 0.0,
+            'proj_pct': 0.0, 'active': False, 'reason': 'requires_batch_cross_section',
+        }
+        r['fcast'] = AgreementEngine.combine(
+            distribution, r['momentum_alpha'], r['lightgbm_cross_sectional'], r['conditional_mr'],
+            r['hurst'], r['hmm'], vni_regime=vni_regime)
         r['costs'] = CostEngine.analyze(r.get('fcast',{}), r.get('liquidity',{}))
         log.info(f"  [{sym}] M9: Risk...")
         sl = RiskEng.stops(df, rs=r.get('stats', {}), fc=r.get('fcast', {}), exchange=exchange, liquidity=r.get('liquidity'), costs=r.get('costs')); r['sl'] = sl
@@ -2122,7 +2639,12 @@ class QuantPipeline:
 
     def batch(self, data, scr_df=None, idx_df=None, exchange_map=None):
         exchange_map = exchange_map or {}
+        data = {sym: _completed_daily_bars(df) for sym, df in data.items()}
+        idx_df = _completed_daily_bars(idx_df)
         # V4.1: Detect VNI regime EARLY so each stock's forecast respects it
+        index_valid = idx_df is not None and DataQualityEngine.audit(idx_df)['status'] != 'FAIL'
+        if not index_valid:
+            idx_df = None
         vni_regime = AdaptiveScorer._detect_vni_regime(idx_df)
         log.info(f"\n  [VNI REGIME] {vni_regime}")
         if vni_regime == 'CRISIS':
@@ -2131,7 +2653,10 @@ class QuantPipeline:
         # V5: Nhóm ngành (ICB) + xu hướng ngành + tương quan chéo/VAR theo ngành
         log.info("\n  [SECTOR] Tra cứu ICB + tính xu hướng ngành + tương quan chéo/VAR...")
         sector_map = SectorEngine.map_symbols(list(data.keys()))
-        sector_trends = SectorEngine.sector_trend(data, sector_map)
+        validated_data = {sym: df for sym, df in data.items()
+                          if VNMarketRules.normalize_exchange(exchange_map.get(sym)) != 'UNKNOWN'
+                          and DataQualityEngine.audit(df, exchange_map[sym])['status'] != 'FAIL'}
+        sector_trends = SectorEngine.sector_trend(validated_data, sector_map)
         sector_groups = {}
         for sym, sec in sector_map.items():
             sector_groups.setdefault(sec, []).append(sym)
@@ -2139,7 +2664,7 @@ class QuantPipeline:
         for sec, syms in sector_groups.items():
             if len(syms) >= 2:
                 log.info(f"    Ngành '{sec}': {len(syms)} mã — {syms}")
-                sector_corr[sec] = CrossCorrelationEngine.analyze_sector(data, syms)
+                sector_corr[sec] = CrossCorrelationEngine.analyze_sector(validated_data, [s for s in syms if s in validated_data])
             else:
                 sector_corr[sec] = {'error': 'Chỉ có 1 mã trong ngành — không tính được tương quan',
                                      'avg_pairwise_corr': None}
@@ -2149,18 +2674,61 @@ class QuantPipeline:
             log.info(f"\n[{i+1}/{len(data)}] === {sym} ===")
             sig, scores = None, None
             if scr_df is not None and not scr_df.empty:
-                mc = [c for c in scr_df.columns if 'ma' in c.lower() or 'symbol' in c.lower()]
+                mc = [c for c in scr_df.columns if _column_key(c) in ('ma', 'ma ck', 'ma cp', 'symbol', 'ticker')]
                 if mc:
-                    m = scr_df[scr_df[mc[0]]==sym]
+                    m = scr_df[scr_df[mc[0]].astype(str).str.strip().str.upper()==sym]
                     if not m.empty:
                         row = m.iloc[0]
-                        sc2 = [c for c in scr_df.columns if 'tin hieu' in c.lower() or 'adj' in c.lower()]
+                        sc2 = [c for c in scr_df.columns if 'tin hieu' in _column_key(c) or 'adj' in _column_key(c)]
                         sig = str(row[sc2[0]]) if sc2 else None
-            rp = self.analyze(sym, df, sig, scores, idx_df, vni_regime=vni_regime, exchange=exchange_map.get(sym, CFG.DEFAULT_EXCHANGE))
+            rp = self.analyze(sym, df, sig, scores, idx_df, vni_regime=vni_regime, exchange=exchange_map.get(sym, 'UNKNOWN'))
             sec = sector_map.get(sym, 'Không xác định')
             rp['sector'] = {'name': sec, 'trend': sector_trends.get(sec, {})}
             rp['cross_corr'] = sector_corr.get(sec, {})
             reports.append(rp)
+
+        # V7: Fit one pooled point-in-time cross-sectional model, then rebuild
+        # directional agreement with sector residuals. MC remains untouched.
+        log.info("\n  [LIGHTGBM] Training cross-sectional absolute/relative-return models...")
+        try:
+            lightgbm_predictions, lightgbm_info = CrossSectionalLightGBMEngine.fit_predict(
+                validated_data, sector_map, idx_df=idx_df, horizon=CFG.FORECAST_HORIZON)
+        except Exception as exc:
+            log.warning(f"  [LIGHTGBM] unavailable: {exc}")
+            lightgbm_predictions, lightgbm_info = {}, {'available': False, 'reason': str(exc)}
+        sector_return_series = CrossSectionalLightGBMEngine.sector_return_series(validated_data, sector_map)
+        for rp in reports:
+            if 'error' in rp: continue
+            sym = rp['symbol']; sec = sector_map.get(sym, 'Không xác định')
+            lgbm = lightgbm_predictions.get(sym, {
+                'available': False, 'signal': 'NEUTRAL', 'direction': 0, 'strength': 0.0,
+                'proj_pct': 0.0, 'active': False, 'reason': lightgbm_info.get('reason', 'no_prediction'),
+            })
+            rp['lightgbm_cross_sectional'] = lgbm
+            rp['cross_sectional_model'] = lightgbm_info
+            rp['conditional_mr'] = ConditionalResidualReversionEngine.analyze(
+                data[sym], idx_df=idx_df, sector_returns=sector_return_series.get(sec),
+                hurst=rp.get('hurst'), hmm=rp.get('hmm'), vni_regime=vni_regime)
+            rp['fcast'] = AgreementEngine.combine(
+                rp.get('fcast', {}), rp.get('momentum_alpha', {}), lgbm, rp['conditional_mr'],
+                rp.get('hurst', {}), rp.get('hmm', {}), vni_regime=vni_regime)
+            rp['costs'] = CostEngine.analyze(rp['fcast'], rp.get('liquidity', {}))
+
+        log.info("\n  [META] Applying logistic meta-label gate (warm-up until enough evaluated trades)...")
+        meta_info = MetaLabelEngine.apply(reports, CFG.FORECAST_LOG_PATH)
+        for rp in reports:
+            if 'error' in rp: continue
+            rp['meta_label_model'] = meta_info
+            exchange = rp.get('exchange', 'UNKNOWN')
+            sl = RiskEng.stops(data[rp['symbol']], rs=rp.get('stats', {}), fc=rp.get('fcast', {}),
+                               exchange=exchange, liquidity=rp.get('liquidity'), costs=rp.get('costs'))
+            rp['sl'] = sl
+            rp['pos'] = {}
+            if sl and sl.get('sl_swing'):
+                rp['pos'] = RiskEng.sizing(
+                    sl['entry'], sl['sl_swing'], acct=self.cfg.ACCOUNT_SIZE,
+                    hold_sessions=rp.get('fcast', {}).get('hold_plan_sessions', CFG.SWING_DEFAULT),
+                    exchange=exchange, liquidity=rp.get('liquidity'))
         # V4: Batch scoring
         log.info("\n  [BATCH] Adaptive cross-sectional scoring...")
         batch_scores = AdaptiveScorer.score_batch(reports, idx_df)
@@ -2172,16 +2740,7 @@ class QuantPipeline:
         reports.sort(key=lambda x:x.get('rec',{}).get('score',0), reverse=True)
         return reports
 
-    # ==============================================================
-    # COMMENTARY ENGINE — V4.1: Thesis-driven narrative
-    # ==============================================================
-    # Structure per stock:
-    #   ① Sức khỏe tài chính — thesis + metrics as PROOF + explain WHY
-    #   ② Trạng thái kỹ thuật — vol regime, trend, money flow as STORY
-    #   ③ Mô hình thống kê — HMM/Forecast/Kelly as CONVICTION measure
-    #   ④ Rủi ro — GARCH, distribution, lock risk as HONEST WARNING
-    #   Kết luận — action + levels + sizing in VND
-    # ==============================================================
+    # COMMENTARY ENGINE 
 
     def generate_commentary(self, r, detailed=False):
         """Keep the legacy report narrative in Summary; use the new thesis only in BUY_ONLY."""
@@ -2342,22 +2901,20 @@ class QuantPipeline:
         hmm_prob = hm.get('prob_pct', 0)
         hmm_warning = hm.get('warning', '')
         ens_ret = fc.get('ensemble_ret_pct', 0)
-        conf = fc.get('confidence', 0)
+        conf = fc.get('agreement_pct', 0)
+        coverage = fc.get('coverage_pct', 0)
+        support = fc.get('support_pct', 0)
+        meta_prob = fc.get('meta_trust_probability')
         mc_src = fc.get('mc', {}).get('vol_source', '')
         prob_up = fc.get('mc', {}).get('prob_up', 50)
 
-        # Thesis from agreement level
-        agree_count = 0
-        if 'BULL' in hmm_cur and hmm_prob >= 60: agree_count += 1
-        if ens_ret > 1: agree_count += 1
-        if ky.get('has_edge'): agree_count += 1
-        if conf >= 66: agree_count += 1
-
-        if agree_count >= 3:
+        # HMM is context, not a direction vote. The thesis comes from the
+        # directional-alpha bundle and the optional meta-label gate.
+        if fc.get('timing_status') == 'READY':
             thesis = 'Mô hình thống kê đồng thuận TĂNG'
-        elif agree_count >= 2:
+        elif fc.get('ensemble_direction') == 'UP':
             thesis = 'Tín hiệu đang hình thành nhưng chưa chín muồi'
-        elif agree_count == 1:
+        elif fc.get('active_models', 0):
             thesis = 'Tín hiệu yếu — mô hình chưa đồng thuận'
         else:
             thesis = 'Không có tín hiệu rõ từ mô hình'
@@ -2383,13 +2940,16 @@ class QuantPipeline:
             narr = f'HMM {hmm_cur} — thị trường đi ngang, chưa rõ hướng'
 
         # Forecast
-        narr += f'. Forecast {ens_ret:+.2f}% trong {fc.get("horizon",10)} phiên'
+        narr += f'. Directional Alpha {ens_ret:+.2f}% trong {fc.get("horizon",10)} phiên'
         if conf >= 66:
             narr += f', Agreement {conf:.0f}% — các mô hình khá đồng thuận'
         elif conf >= 50:
             narr += f', Agreement {conf:.0f}% — tín hiệu đang hình thành, chưa chín muồi'
         else:
-            narr += f', Agreement {conf:.0f}% — ngang tung đồng xu, mô hình chưa rõ hướng'
+            narr += f', Agreement {conf:.0f}% — mô hình chưa rõ hướng'
+        narr += f', Coverage {coverage:.0f}% và Support {support:.0f}%'
+        if meta_prob is not None:
+            narr += f', Meta-label P(win) {float(meta_prob)*100:.1f}%'
 
         if mc_src:
             narr += f' (MC dùng {mc_src} vol)'
@@ -2418,7 +2978,7 @@ class QuantPipeline:
         lines.append(narr + '.')
         return '\n'.join(lines)
 
-    # -----------------------------------------------------------------
+    # -----
     def _section_risk(self, ga, eg, di, ft, rs, lock, sl):
         """④ Honest risk warnings with explanation of WHY each metric matters."""
         lines = []
@@ -2571,10 +3131,17 @@ class QuantPipeline:
                 'TuongQuanNganh': cc.get('avg_pairwise_corr'),
                 'MaDanDatNganh': top_lead,
                 'Sharpe':rs.get('sharpe',0), 'WinRate':rs.get('win_rate_pct',0),
+                'MetricScope': rs.get('metric_scope', 'DAILY_PRICE_RETURNS_NOT_TRADES'),
                 'MaxDD':rs.get('max_dd_pct',0), 'AnnRet':rs.get('ann_return_pct',0),
                 'HMM':hm.get('current',''), 'VolReg':vl.get('regime',''),
                 'Forecast':fc.get('consensus',''), 'EnsRet%':fc.get('ensemble_ret_pct',0),
                 'Agreement':fc.get('agreement_pct',fc.get('confidence',0)),
+                'Coverage%':fc.get('coverage_pct',0), 'AlphaSupport%':fc.get('support_pct',0),
+                'ActiveModels':fc.get('active_models',0),
+                'MetaTrust%':round(float(fc.get('meta_trust_probability'))*100,1) if fc.get('meta_trust_probability') is not None else None,
+                'Hurst':fc.get('hurst',{}).get('hurst'), 'HurstRegime':fc.get('hurst',{}).get('regime',''),
+                'LightGBMRank%':r.get('lightgbm_cross_sectional',{}).get('rank_pct'),
+                'LightGBMAlpha%':r.get('lightgbm_cross_sectional',{}).get('predicted_alpha_pct'),
                 'GrossFc%':costs.get('gross_forecast_pct',fc.get('ensemble_ret_pct',0)),
                 'CostRT%':costs.get('roundtrip_cost_pct',0), 'NetFc%':costs.get('net_forecast_pct',0),
                 'MCVol':fc.get('mc',{}).get('vol_source',''),
@@ -2598,14 +3165,16 @@ class QuantPipeline:
         }
         return summary
 
-# ==============================================================
 # FORECAST LOGGER
-# ==============================================================
 
 class ForecastLogger:
-    COLUMNS = ['symbol','run_date','horizon','forecast_dir','forecast_ret_pct',
-               'forecast_price','consensus','confidence','actual_price','actual_ret_pct','hit',
-               'base_date','base_price','evaluation_method']
+    COLUMNS = [
+        'symbol','run_date','horizon','forecast_dir','forecast_ret_pct',
+        'forecast_price','consensus','confidence','actual_price','actual_ret_pct','hit',
+        'base_date','base_price','evaluation_method',
+        'entry','sl','tp1','trade_outcome','meta_label',
+        *MetaLabelEngine.FEATURES,
+    ]
     def __init__(self, filepath='forecast_log.csv'):
         self.filepath = Path(filepath)
         if not self.filepath.exists():
@@ -2625,17 +3194,22 @@ class ForecastLogger:
             if 'error' in rp: continue
             fc = rp.get('fcast',{}); 
             if not fc: continue
-            rows.append({
+            sl = rp.get('sl', {})
+            row = {
                 'symbol': rp['symbol'], 'run_date': now,
                 'horizon': horizon if horizon is not None else fc.get('horizon', CFG.SWING_DEFAULT),
                 'forecast_dir': 'UP' if 'TANG' in fc.get('consensus','') else ('DOWN' if 'GIAM' in fc.get('consensus','') else 'FLAT'),
                 'forecast_ret_pct': fc.get('ensemble_ret_pct',0), 'forecast_price': fc.get('ensemble_price',0),
-                'consensus': fc.get('consensus',''), 'confidence': fc.get('confidence',0),
+                'consensus': fc.get('consensus',''), 'confidence': fc.get('agreement_pct',0),
                 'actual_price': '', 'actual_ret_pct': '', 'hit': '',
                 'base_date': str(rp['_price_dates'][-1]) if rp.get('_price_dates') else '',
                 'base_price': rp['_price_close'][-1] if rp.get('_price_close') else np.nan,
                 'evaluation_method': '',
-            })
+                'entry': sl.get('entry'), 'sl': sl.get('sl_swing'), 'tp1': sl.get('tp1'),
+                'trade_outcome': '', 'meta_label': '',
+            }
+            row.update(MetaLabelEngine.report_features(rp))
+            rows.append(row)
         if rows:
             pd.DataFrame(rows, columns=self.COLUMNS).to_csv(self.filepath, mode='a', header=False, index=False)
             log.info(f"Logged {len(rows)} forecasts")
@@ -2658,7 +3232,8 @@ class ForecastLogger:
                 fetch_days = max(60, days_back, (pd.Timestamp.now().normalize() - earliest.normalize()).days + 10)
                 sd = bridge.fetch_ohlcv([sym], days=fetch_days, delay=0.1)
                 if sym not in sd: continue
-                prices = sd[sym]['close'].sort_index()
+                bars = _completed_daily_bars(sd[sym]).sort_index()
+                prices = bars['close']
                 if prices.index.has_duplicates: continue
                 for idx in sym_pending.index:
                     base_dt = pd.Timestamp(df.loc[idx,'base_date']).normalize()
@@ -2681,17 +3256,42 @@ class ForecastLogger:
                     df.loc[idx,'actual_price'] = round(actual,0)
                     df.loc[idx,'actual_ret_pct'] = round(actual_ret_pct,2)
                     df.loc[idx,'hit'] = hit; updated += 1
-                    df.loc[idx,'evaluation_method'] = 'observed_sessions_v1'
+                    method = 'observed_sessions_v1'
+                    try:
+                        entry = float(df.loc[idx, 'entry']); stop = float(df.loc[idx, 'sl']); tp1 = float(df.loc[idx, 'tp1'])
+                        future_bars = bars[(bars.index.normalize() > base_dt) &
+                                           (bars.index.normalize() < pd.Timestamp.now().normalize())].iloc[:horizon]
+                        if (len(future_bars) == horizon and {'high','low'}.issubset(future_bars.columns)
+                                and np.isfinite([entry, stop, tp1]).all() and 0 < stop < entry < tp1):
+                            tp_positions = np.flatnonzero(pd.to_numeric(future_bars['high'], errors='coerce').values >= tp1)
+                            sl_positions = np.flatnonzero(pd.to_numeric(future_bars['low'], errors='coerce').values <= stop)
+                            first_tp = int(tp_positions[0]) if len(tp_positions) else horizon + 1
+                            first_sl = int(sl_positions[0]) if len(sl_positions) else horizon + 1
+                            trade_win = int(first_tp < first_sl and first_tp <= horizon)
+                            if trade_win:
+                                outcome = 'TP1_BEFORE_SL'
+                            elif first_sl <= horizon:
+                                outcome = 'SL_BEFORE_TP1'
+                            else:
+                                outcome = 'NO_TP1_WITHIN_HORIZON'
+                            df.loc[idx, 'meta_label'] = trade_win
+                            df.loc[idx, 'trade_outcome'] = outcome
+                            method = 'observed_sessions_v2_tp_sl'
+                    except (TypeError, ValueError):
+                        pass
+                    df.loc[idx,'evaluation_method'] = method
             except Exception as e: log.warning(f"Eval {sym}: {e}")
         df.to_csv(self.filepath, index=False)
-        evaluated = df[df['hit'].isin(['Y','N']) & (df['evaluation_method'] == 'observed_sessions_v1')]
+        evaluated = df[df['hit'].isin(['Y','N']) & df['evaluation_method'].isin(
+            ['observed_sessions_v1', 'observed_sessions_v2_tp_sl'])]
         if evaluated.empty: return {'total': 0}
         total = len(evaluated); hits = len(evaluated[evaluated['hit']=='Y'])
-        return {'total': total, 'hits': hits, 'hit_rate_pct': round(hits/total*100,1)}
+        labelled = pd.to_numeric(evaluated.get('meta_label'), errors='coerce').dropna()
+        return {'total': total, 'hits': hits, 'hit_rate_pct': round(hits/total*100,1),
+                'meta_labelled': len(labelled),
+                'trade_win_rate_pct': round(float(labelled.mean()*100), 1) if len(labelled) else None}
 
-# ==============================================================
-# FORECAST SHEET EXPORT — for report.py chart rendering
-# ==============================================================
+# FORECAST SHEET EXPORT 
 
 def _export_forecast_sheet(reports, output_path):
     """Append a 'Forecast' sheet to the existing quant_report.xlsx.
@@ -2825,12 +3425,10 @@ def _export_forecast_sheet(reports, output_path):
     log.info(f"  Forecast sheet exported: {len(rows)} rows for {df_fc['Symbol'].nunique()} symbols → {output_path}")
 
 
-# ==============================================================
-# ENHANCED EXCEL FALLBACK (if backtest_engine not available)
-# ==============================================================
+# ENHANCED EXCEL FALLBACK 
 
 # Excel reporting helpers: summary stays compact; BUY_ONLY carries the quant thesis.
-BUY_ACTIONS = frozenset({'BUY_NOW', 'BUY_SETUP'})
+BUY_ACTIONS = frozenset({'BUY_NOW'})
 RATINGS = {'BUY_NOW': 'MUA NGAY', 'BUY_SETUP': 'CHỜ ĐIỂM MUA',
            'WATCH': 'THEO DÕI', 'AVOID': 'TRÁNH'}
 
@@ -2880,9 +3478,13 @@ def commentary(r, detailed=False):
     eg = r.get('garch', {}).get('egarch', {}); sl = r.get('sl', {}); pos = r.get('pos', {})
     rc = r.get('rec', {}); dist = r.get('dist', {}); lock = fc.get('lock_risk', {})
     agreement = fc.get('agreement_pct', fc.get('confidence'))
-    extended = above(momentum.get('rsi'), 70) or above(alpha.get('mean_reversion', {}).get('z_score'), 2)
+    mom_alpha = r.get('momentum_alpha', {}); lgbm_alpha = r.get('lightgbm_cross_sectional', {})
+    conditional_mr = r.get('conditional_mr', {}); hurst = r.get('hurst', {})
+    ret5 = mom_alpha.get('components', {}).get('ret_5d_pct')
+    extended = above(momentum.get('rsi'), 75) or above(ret5, 8)
     short = (f'RS20 {num(rel.get("rs_20d_pct"))}%, CMF {num(flow.get("cmf"))}; HMM {hm.get("current", "N/A")}. '
-             f'Net forecast {num(costs.get("net_forecast_pct"))}%, Model Agreement {num(agreement, 0)}%; '
+             f'Net forecast {num(costs.get("net_forecast_pct"))}%, Agreement {num(agreement, 0)}%, '
+             f'Coverage {num(fc.get("coverage_pct"), 0)}%, Support {num(fc.get("support_pct"), 0)}%; '
              f'entry {"extended" if extended else "cần đối chiếu hỗ trợ/kháng cự"}. Action = {action}.')
     if not detailed or action not in BUY_ACTIONS:
         return short
@@ -2895,9 +3497,12 @@ def commentary(r, detailed=False):
     state = hm.get('current', 'N/A')
     prob_text = ', '.join(f'{k} {num(v, 1)}%' for k, v in hm.get('state_probs', {}).items()) or 'chưa có xác suất tin cậy'
     components = fc.get('component_returns', {}); weights = fc.get('weights', {})
-    mixed = any(above(v, 0) for v in components.values()) and any(below(v, 0) for v in components.values())
-    forecast_read = ('MC/Momentum đang nâng forecast trong khi Mean Reversion thận trọng hơn' if mixed
-                     else 'các component hiện nghiêng cùng hướng, nên ensemble có nền tảng đồng nhất hơn')
+    directional_returns = [components.get('momentum_ret_pct'), components.get('lightgbm_ret_pct'),
+                           components.get('conditional_mr_ret_pct')]
+    directional_returns = [v for v in directional_returns if isinstance(v, (int, float))]
+    mixed = any(above(v, 0) for v in directional_returns) and any(below(v, 0) for v in directional_returns)
+    forecast_read = ('directional alpha đang có xung đột nội bộ' if mixed
+                     else 'các directional component hiện nghiêng cùng hướng')
     construction = sl.get('construction', {})
     constraints = {'risk': pos.get('shares_by_risk'), 'allocation': pos.get('shares_by_allocation'), 'liquidity': pos.get('shares_by_liquidity')}
     valid = {k: v for k, v in constraints.items() if isinstance(v, (int, float)) and v > 0}
@@ -2913,8 +3518,8 @@ def commentary(r, detailed=False):
         f'{symbol} có historical return profile đáng chú ý: CAGR {num(stats.get("ann_return_pct"))}%, Sharpe {num(stats.get("sharpe"))}, Sortino {num(stats.get("sortino"))}, Calmar {num(stats.get("calmar"))} và MaxDD {num(stats.get("max_dd_pct"))}%. Chất lượng lựa chọn vì vậy không chỉ nằm ở mức tăng, mà ở hiệu quả so với volatility, downside và drawdown. RS20 {num(rel.get("rs_20d_pct"))}% so với VNINDEX, beta {num(rel.get("beta"))} và alpha proxy {num(rel.get("alpha_ann_pct"))}% cho thấy {"sức mạnh gần đây có phần độc lập với beta thị trường" if above(rel.get("rs_20d_pct"), 0) and below(rel.get("beta"), .8) else "relative edge chưa đủ tách khỏi biến động thị trường"}.',
         f'Bức tranh hiện tại được củng cố bởi volatility và money flow: Vol Ratio {num(vol.get("vol_ratio"))}, Vol Percentile {num(vol.get("vol_pctile"), 1)}%, CMF {num(flow.get("cmf"))} và OBV {volume.get("obv_trend", "N/A")}. {"Đây là confluence của volatility contraction, buying pressure và relative strength" if below(vol.get("vol_ratio"), .7) and above(flow.get("cmf"), 0) and above(rel.get("rs_20d_pct"), 0) else "Các tín hiệu chưa hoàn toàn đồng thuận, nên money flow cần được xác nhận thêm bằng price action"}.',
         f'Tuy nhiên trend quality mới là phần quyết định regime confirmation. ER {num(trend.get("er"))}, slope {num(trend.get("slope_pct"))}%/phiên và R² {num(trend.get("r2"))} cho thấy {"giá còn đi qua nhiều noise dù hướng chính tích cực" if below(trend.get("er"), .4) else "đường giá có cấu trúc tương đối liền mạch"}. HMM hiện ở {state}, với state probabilities {prob_text}; vì vậy stock selection quality có thể cao hơn regime confirmation. Đây là setup sớm hơn là breakout đã được xác nhận hoàn toàn.',
-        f'Momentum đang tạo ra xung đột với execution: RSI {num(momentum.get("rsi"), 1)}, ROC {num(momentum.get("roc_10d"))}% và z-score {num(alpha.get("mean_reversion", {}).get("z_score"))}. {"RSI cao khiến giá bị extended và làm downside asymmetry xấu đi; selection quality tốt nhưng entry quality bắt đầu xấu" if extended else f"Momentum chưa cho thấy extension cực đoan, nhưng entry vẫn cần đặt quanh hỗ trợ {supports} thay vì đuổi theo giá"}. Kháng cự gần nhất là {resistances}.',
-        f'Forecast {num(fc.get("ensemble_ret_pct"))}% trong {num(fc.get("horizon"), 0)} phiên đến từ MC {num(components.get("mc_ret_pct"))}% (w {num(weights.get("mc"), 2)}), Mean Reversion {num(components.get("mr_ret_pct"))}% (w {num(weights.get("mean_reversion"), 2)}) và Momentum {num(components.get("mom_ret_pct"))}% (w {num(weights.get("momentum"), 2)}). {forecast_read}. Gross {num(costs.get("gross_forecast_pct", fc.get("ensemble_ret_pct")))}% trừ cost {num(costs.get("roundtrip_cost_pct"))}% còn net {num(costs.get("net_forecast_pct"))}%. Agreement {num(agreement, 0)}% không phải xác suất lợi nhuận; mức đồng thuận {"còn thấp, nên forecast dương chưa đủ để chase" if below(agreement, 66) else "tương đối tốt"}.',
+        f'Momentum multi-horizon có score {num(mom_alpha.get("score"), 3)}, lợi nhuận 5 phiên {num(ret5)}%; Hurst {num(hurst.get("hurst"), 3)} thuộc regime {hurst.get("regime", "N/A")}. Conditional residual reversion {"đang hoạt động" if conditional_mr.get("active") else "đang abstain"}, residual z-score {num(conditional_mr.get("residual_z"), 2)}. {"Giá đang extended nên entry quality thấp" if extended else f"Entry chưa quá extended nhưng vẫn nên đối chiếu hỗ trợ {supports}"}. Kháng cự gần nhất là {resistances}.',
+        f'Directional Alpha {num(fc.get("ensemble_ret_pct"))}% trong {num(fc.get("horizon"), 0)} phiên đến từ Momentum {num(components.get("momentum_ret_pct"))}% (w {num(weights.get("momentum"), 2)}), LightGBM {num(components.get("lightgbm_ret_pct"))}% (w {num(weights.get("lightgbm_cross_sectional"), 2)}, rank {num(lgbm_alpha.get("rank_pct"), 1)}%) và Conditional Reversion {num(components.get("conditional_mr_ret_pct"))}% (w {num(weights.get("conditional_residual_reversion"), 2)}). {forecast_read}. GARCH–MC không bỏ phiếu hướng; nó ước lượng distribution mean {num(components.get("mc_distribution_mean_ret_pct"))}% và T-lock risk. Gross {num(costs.get("gross_forecast_pct", fc.get("ensemble_ret_pct")))}% trừ cost {num(costs.get("roundtrip_cost_pct"))}% còn net {num(costs.get("net_forecast_pct"))}%. Agreement {num(agreement, 0)}%, Coverage {num(fc.get("coverage_pct"), 0)}%, Support {num(fc.get("support_pct"), 0)}%; Meta-label {num(float(fc.get("meta_trust_probability"))*100 if fc.get("meta_trust_probability") is not None else None, 1)}%.',
         f'Risk Engine phản ứng với mức conviction đó bằng trade construction có kiểm soát. Entry {num(sl.get("entry"), 0)}, ATR {num(sl.get("atr"))}, SL {num(sl.get("sl_swing"), 0)} sau khi so ATR stop với VaR-adjusted floor {num(construction.get("stop_floor_pct"))}%. TP1 {num(sl.get("tp1"), 0)}; base TP2 {num(construction.get("base_tp2"), 0)} được kéo về {num(construction.get("conviction_tp2"), 0)} rồi chốt final TP2 {num(sl.get("tp2"), 0)} vì conviction {num(sl.get("conviction"))}. Đây là risk-adjusted/conviction-adjusted target, không gọi là optimized khi internal optimization đang tắt. R:R TP1 1:{num(sl.get("rr1"))}, TP2 1:{num(sl.get("rr2"))}; expected holding {fc.get("hold_plan_label", "N/A")}.',
         f'Tail và settlement risk hiện ở mức {risk_text}. {tail_text}. VaR95 {num(stats.get("VaR_95"))}% và CVaR95 {num(stats.get("CVaR_95"))}%; GARCH persistence {num(ga.get("persistence"), 3)}, alpha {num(ga.get("alpha"), 3)} và EGARCH gamma {num(eg.get("gamma"), 3)} cho thấy {"negative shock có thể làm volatility tăng mạnh và kéo dài" if below(eg.get("gamma"), -.05) or above(ga.get("persistence"), .95) else "shock risk cần tiếp tục theo dõi"}. Trong settlement lock {num(lock.get("lock_sessions", sl.get("lock_sessions")), 0)} phiên, MC lock drawdown {num(lock.get("max_dd_lock_pct"))}% và historical MAE {num(sl.get("mae_lock_10pct"))}%; {"stop có thể không phải guaranteed loss boundary trước khi vị thế được xử lý" if sl.get("lock_risk_flag") else "lock risk chưa cho thấy cảnh báo vượt stop rõ ràng"}.',
         f'Position sizing cho phép {num(constraints.get("risk"), 0)} cp theo risk, {num(constraints.get("allocation"), 0)} cp theo allocation và {num(constraints.get("liquidity"), 0)} cp theo liquidity; vị thế cuối {num(pos.get("shares"), 0)} cp, giá trị {num(pos.get("value"), 0)} VND ({num(pos.get("pct_acct"), 1)}% NAV), theoretical loss tại SL {num(pos.get("max_loss"), 0)} VND ({num(pos.get("risk_pct_nav"))}% NAV). Binding constraint là {binding}. Score {num(rc.get("score"), 0)}/100 là composite ranking/quality score, không phải xác suất profit.',
@@ -2949,7 +3554,9 @@ def export_buy_workbook(summary_df, output_path, reports=None):
         buy = buy.sort_values('Score', ascending=False)
     columns = [('Mã', 'Symbol'), ('Action', 'Action'), ('Score', 'Score'), ('Rating', 'Rating'),
                ('VNI Regime', 'VNI'), ('Sector', 'NhomNganh'), ('Net Forecast %', 'NetFc%'),
-               ('Model Agreement %', 'Agreement'), ('HMM', 'HMM'), ('Liquidity Tier', 'LiqTier'),
+               ('Agreement %', 'Agreement'), ('Coverage %', 'Coverage%'), ('Support %', 'AlphaSupport%'),
+               ('Meta Trust %', 'MetaTrust%'), ('LightGBM Rank %', 'LightGBMRank%'),
+               ('Hurst Regime', 'HurstRegime'), ('HMM', 'HMM'), ('Liquidity Tier', 'LiqTier'),
                ('Entry', 'Entry'), ('SL', 'SL'), ('TP1', 'TP1'), ('TP2', 'TP'), ('Shares', 'Shares'),
                ('Position Value', 'PositionValue'), ('Risk % NAV', 'RiskPctNAV'),
                ('Holding Period', 'HoldPlan'), ('Analysis', 'Analysis')]
@@ -2993,32 +3600,15 @@ def _export_enhanced_inline(summary_df, output_path):
     """Compatibility Excel entry point using the same two-level workbook."""
     return export_buy_workbook(summary_df, output_path)
 
-
-# ==============================================================
 # MAIN
-# ==============================================================
-
-# ==============================================================
-# BUY-ONLY SUMMARY EXCEL — Tổng hợp chỉ mã khuyến nghị MUA
-# ==============================================================
 
 def _export_buy_summary(summary_df, output_path='buy_summary.xlsx', vni_regime='NEUTRAL', reports=None):
     """Export all-stock Summary plus final-action-gated BUY_ONLY; prices in VND."""
     return export_buy_workbook(summary_df, output_path, reports=reports)
 
 
-# ==============================================================
-# M-SECTOR-FLOW: DÒNG TIỀN NGÀNH (từ Watchlist.xlsx) -> Excel
-# ==============================================================
-#
-# Đo dòng tiền theo ngành = tỷ trọng GTGD của các mã TĂNG / ĐỨNG / GIẢM
-# giá trong ngành, weight theo giá trị giao dịch (close * volume) phiên
-# gần nhất. Dùng lại SectorEngine.WATCHLIST_SECTORS (đã map sẵn từ file
-# Watchlist.xlsx) — không phải đọc lại Excel mỗi lần chạy.
-#
-# Muốn nạp trực tiếp từ 1 file Watchlist.xlsx khác (không dùng bản
-# hard-code trong SectorEngine) thì dùng load_watchlist_sectors_from_excel().
-# ==============================================================
+
+# M-SECTOR-FLOW: DÒNG TIỀN NGÀNH
 
 FLOW_FLAT_THRESHOLD = 0.0015  # |%thay đổi| < 0.15% => coi là "đứng giá"
 
@@ -3236,9 +3826,7 @@ def export_sector_cashflow(ohlcv_data: dict = None, symbols: list = None,
 
     - Nếu truyền sẵn `ohlcv_data` (vd. tái sử dụng data đã fetch trong
       run_pipeline) -> dùng luôn, không fetch lại.
-    - Nếu không, sẽ tự fetch OHLCV cho toàn bộ mã trong `sectors`
-      (hoặc watchlist_path, hoặc SectorEngine.WATCHLIST_SECTORS mặc định)
-      qua ScreenerBridge (KBS -> VCI).
+    - Không tự fetch dòng tiền ngành; caller phải cung cấp `ohlcv_data`.
     - `push_to_gsheet=True` (mặc định) -> đẩy thẳng 3 cột (Ngành, %Thay đổi,
       GTGD) + heatmap lên Google Sheet, tab `gsheet_worksheet` ('Analysis').
     """
@@ -3248,11 +3836,7 @@ def export_sector_cashflow(ohlcv_data: dict = None, symbols: list = None,
         sectors = SectorEngine.WATCHLIST_SECTORS
 
     if ohlcv_data is None:
-        all_syms = sorted({s for syms in sectors.values() for s in syms})
-        missing = [s for s in all_syms if s not in (symbols or [])] if symbols else all_syms
-        bridge = ScreenerBridge(source=source)
-        log.info(f"[SECTOR-FLOW] Fetch OHLCV cho {len(missing)} mã...")
-        ohlcv_data = bridge.fetch_ohlcv(missing, days=days) if missing else {}
+        raise ValueError('Sector cashflow fetching has been removed; supply ohlcv_data explicitly')
 
     flow_df = compute_sector_cashflow(ohlcv_data, sectors)
     if not flow_df.empty:
@@ -3305,7 +3889,8 @@ def _export_recommendations_parquet(summary_df, output_path='cache/recommendatio
     # Map score → action
     def _score_to_action(row):
         action = str(row.get('Action', 'AVOID')).upper()
-        if action in ('BUY_NOW','BUY_SETUP'): return 'BUY'
+        if action == 'BUY_NOW': return 'BUY'
+        if action == 'BUY_SETUP': return 'WATCH'
         if action == 'WATCH': return 'HOLD'
         return 'AVOID'
 
@@ -3370,10 +3955,7 @@ def _export_recommendations_parquet(summary_df, output_path='cache/recommendatio
 
     return output_path
 
-
-# ============================================================================
-# GOOGLE SHEETS EXPORT (cho Quant Pipeline) — song song với Excel
-# ============================================================================
+# GOOGLE SHEETS EXPORT
 
 def _symbol_to_sector_map(sectors: dict) -> dict:
     """Đảo {ngành: [mã,...]} -> {mã: ngành}. Mã trùng nhiều ngành -> lấy ngành đầu tiên gặp."""
@@ -3609,6 +4191,7 @@ def _simplify_user_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
     hidden_columns = [
         'Exchange', 'Timing', 'Screener', 'PWinCalibrated%', 'EV_R',
         'RR_NetCost', 'Shares', 'PositionValue', 'MaxLossVND', 'Method',
+        'MetricScope',
     ]
     out = summary_df.drop(columns=hidden_columns, errors='ignore').copy()
 
@@ -3621,6 +4204,12 @@ def _simplify_user_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
         'NET_FORECAST_TOO_LOW': 'Lợi nhuận dự kiến không đủ bù chi phí',
         'FORECAST_NOT_UP': 'Giá chưa được dự báo tăng',
         'TIMING_BLOCKED': 'Chưa phải thời điểm phù hợp để mua',
+        'TIMING_NOT_READY': 'Chờ xác nhận thời điểm vào lệnh',
+        'UNKNOWN_EXCHANGE': 'Chưa xác định được sàn giao dịch',
+        'VNI_DATA_MISSING': 'Thiếu dữ liệu VN-Index hợp lệ',
+        'INVALID_FORECAST': 'Dự báo không hợp lệ',
+        'INVALID_TRADE_PLAN': 'Mức giá, mục tiêu hoặc chi phí chưa tạo thành kế hoạch hợp lệ',
+        'ZERO_POSITION_SIZE': 'Không đủ quy mô cho một lô giao dịch',
         'SETTLEMENT_LOCK_RISK': 'Có thể giảm giá trong thời gian chờ T+2',
         'VNI_CRISIS': 'Thị trường chung đang có rủi ro cao',
         'POSITION_TOO_SMALL': 'Quy mô mua không phù hợp',
@@ -3689,6 +4278,10 @@ def _simplify_user_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
         'EnsRet%': 'Lợi nhuận dự báo (%)',
         'GrossFc%': 'Lợi nhuận gộp (%)', 'CostRT%': 'Chi phí (%)',
         'NetFc%': 'Lợi nhuận ròng (%)', 'Agreement': 'Đồng thuận (%)',
+        'Coverage%': 'Coverage mô hình (%)', 'AlphaSupport%': 'Directional support (%)',
+        'ActiveModels': 'Số mô hình hoạt động', 'MetaTrust%': 'Meta-label P(win) (%)',
+        'Hurst': 'Hurst', 'HurstRegime': 'Hurst regime',
+        'LightGBMRank%': 'LightGBM rank (%)', 'LightGBMAlpha%': 'LightGBM alpha (%)',
         'MCVol': 'Biến động mô phỏng', 'LockDD%': 'Sụt giảm khi chờ T+2 (%)',
         'PLoss3%': 'Xác suất lỗ trên 3% (%)', 'DQFlags': 'Cảnh báo dữ liệu',
         'CapacityShares': 'Sức chứa tối đa (cổ phiếu)', 'GapP95%': 'Khoảng trống giá 95% (%)',
@@ -3697,7 +4290,7 @@ def _simplify_user_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
         'PWinCalibrated%': 'Xác suất thắng hiệu chỉnh (%)',
         'EV_R': 'Giá trị kỳ vọng/rủi ro', 'RR_NetCost': 'Lời/rủi ro',
         'Shares': 'Số cổ phiếu',
-        'PositionValue': 'Giá trị mua (triệu)', 'MaxLossVND': 'Lỗ tối đa (triệu)',
+        'PositionValue': 'Giá trị mua (triệu)', 'MaxLossVND': 'Lỗ ước tính tại SL (triệu)',
         'Method': 'Phương pháp chấm điểm', 'Analysis': 'Nhận xét chi tiết',
         'Nganh_PctChange': 'Thay đổi ngành (%)',
         'Nganh_GTGD_ty': 'GTGD ngành (tỷ)',
@@ -3913,7 +4506,10 @@ def _export_dashboard_architecture(summary_df, reports, output_path='quant_dashb
         add_df('02_Data_Quality', summary_df[[c for c in ['Symbol','Exchange','DQStatus','DQScore','DQFlags'] if c in summary_df.columns]])
         add_df('03_Liquidity', summary_df[[c for c in ['Symbol','LiqTier','ADV20_Bn','CapacityShares','GapP95%'] if c in summary_df.columns]])
         add_df('04_Risk_Position', summary_df[[c for c in ['Symbol','Entry','SL','TP1','TP','RR_NetCost','Shares','PositionValue','MaxLossVND'] if c in summary_df.columns]])
-        add_df('05_Model_Monitor', summary_df[[c for c in ['Symbol','HMM','Forecast','GrossFc%','Agreement','CostRT%','NetFc%','VolReg','Method'] if c in summary_df.columns]])
+        add_df('05_Model_Monitor', summary_df[[c for c in ['Symbol','HMM','Hurst','HurstRegime','Forecast','GrossFc%',
+                                                           'Agreement','Coverage%','AlphaSupport%','ActiveModels',
+                                                           'MetaTrust%','LightGBMRank%','LightGBMAlpha%',
+                                                           'CostRT%','NetFc%','VolReg','Method'] if c in summary_df.columns]])
         add_df('06_Sector', summary_df[[c for c in ['Symbol','NhomNganh','XuHuongNganh','NganhRet20D%','TuongQuanNganh','MaDanDatNganh'] if c in summary_df.columns]])
     cfg_df = pd.DataFrame([{'Parameter':k,'Value':str(v)} for k,v in vars(CFG).items()])
     add_df('07_Config', cfg_df)
@@ -3927,7 +4523,7 @@ def run_pipeline(excel_path=None, symbols=None, account_size=500_000_000,
                  use_google_sheets=True, gsheet_name='LỌC CỔ PHIẾU',
                  gsheet_credentials='credentials.json',
                  gsheet_id='1KMf4vwX7uqkIAvr2KGMXnYRc-_f8jmdkTYIG3TyUpG4',
-                 export_sector_flow=True, sector_flow_excel=None,
+                 export_sector_flow=False, sector_flow_excel=None,
                  sector_flow_watchlist=None, generate_visuals=None, visual_top_n=None,
                  visual_output_dir=None):
     global CFG
@@ -3986,33 +4582,11 @@ def run_pipeline(excel_path=None, symbols=None, account_size=500_000_000,
                                             output_path='cache/recommendations_latest.parquet',
                                             vni_regime=vni_reg)
         except Exception as e: log.warning(f"Recommendations parquet export error: {e}")
-    # ── Tính Dòng tiền ngành (từ Watchlist.xlsx / SectorEngine map) ──
-    # PURE_SECTORS: không trùng mã -> Tỷ trọng (%) phản ánh đúng tỷ trọng
-    # GTGD thị trường thật. THEMATIC_GROUPS: trùng mã cố ý (Vingroup, FPT
-    # nhóm, Viettel, Tự doanh, List CMSC...) -> chỉ để theo dõi riêng, KHÔNG
-    # cộng vào tổng GTGD thị trường.
-    flow_df = pd.DataFrame()
-    sector_map = None
+    # Deprecated arguments remain accepted for existing callers. Sector cashflow
+    # fetching/export has been removed from this pipeline, including opt-in calls.
     if export_sector_flow:
-        try:
-            sector_map = (load_watchlist_sectors_from_excel(sector_flow_watchlist)
-                          if sector_flow_watchlist else SectorEngine.PURE_SECTORS)
-            all_sector_syms = sorted({s for syms in sector_map.values() for s in syms})
-            missing = [s for s in all_sector_syms if s not in symbols]
-            extra_ohlcv = bridge.fetch_ohlcv(missing, days=lookback_days) if missing else {}
-            combined_ohlcv = {**data, **extra_ohlcv}
-            flow_df = compute_sector_cashflow(combined_ohlcv, sector_map)
-            if not flow_df.empty:
-                print(f"\n{'='*70}\n  DÒNG TIỀN NGÀNH (Top by GTGD)\n{'='*70}")
-                print(flow_df[['Nganh', 'PctChange', 'GTGD_ty', 'TangPct', 'GiamPct', 'DongTienRong_ty']]
-                      .to_string(index=False))
-            if sector_flow_excel:
-                _export_sector_flow_excel(flow_df, sector_flow_excel)
-        except Exception as e:
-            log.warning(f"Sector cashflow compute/export error: {e}")
+        log.info('Sector cashflow fetching is removed; export_sector_flow is ignored')
     # ── Export Google Sheets (song song Excel, không thay thế) ──
-    # flow_df -> gộp thẳng 3 cột Nganh/%/GTGD + heatmap vào NGAY tab Summary,
-    # không tách sheet riêng.
     if use_google_sheets and not summary.empty:
         try:
             _export_to_gsheet(summary, spreadsheet_name=gsheet_name,
@@ -4020,7 +4594,7 @@ def run_pipeline(excel_path=None, symbols=None, account_size=500_000_000,
                               spreadsheet_id=gsheet_id)
         except Exception as e: log.warning(f"Google Sheets export error: {e}")
     try:
-        flogger = ForecastLogger('forecast_log.csv')
+        flogger = ForecastLogger(CFG.FORECAST_LOG_PATH)
         flogger.log_reports(reports); flogger.evaluate(bridge)
     except Exception as e: log.warning(f"Forecast logger: {e}")
     return reports, summary
@@ -4028,10 +4602,10 @@ def run_pipeline(excel_path=None, symbols=None, account_size=500_000_000,
 if __name__ == '__main__':
     print("""
     ╔══════════════════════════════════════════════╗
-    ║    QUANT PIPELINE V6 VN.1 — HOSE Swing Trading  ║
-    ║    FIX: HMM stable seed, GARCH-MC vol cap,   ║
-    ║         VNI crisis breaker, blended scoring,  ║
-    ║         forecast cap, regime-aware timing     ║
+    ║    QUANT PIPELINE V7 — VN Swing Trading       ║
+    ║    Alpha: Momentum + LightGBM + Cond. MR      ║
+    ║    Router: Hurst/HMM | Risk: GARCH-MC/T-lock  ║
+    ║    Gate: Agreement V2 + Logistic Meta-label   ║
     ╚══════════════════════════════════════════════╝
     """)
     if '--symbols' in sys.argv:
